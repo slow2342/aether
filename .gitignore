@@ -1,5 +1,4 @@
 /target
-.claude
 
 # IDE
 .idea/
@@ -15,8 +14,14 @@ Thumbs.db
 .env
 .env.*
 
-# Cargo
-Cargo.lock
+# Cargo.lock is committed for reproducible builds (binary application)
 
 # Benchmarks
 criterion/
+
+# AI/Spec generated files — never commit these
+*.spec
+spec/
+specs/
+.claude/plans/
+.claude/sessions/
