@@ -106,7 +106,15 @@ Describe any tests added or modified. Skip this section if no test changes.
 Steps to verify the changes work correctly, e.g.:
 - Commands to run (cargo build, cargo test, etc.)
 - Manual verification steps if applicable
+
+## Related issues
+
+Refs #123, #456
 ```
+
+- Reference related issues with `Refs #<issue>`
+- Skip this section if no related issues
+- Do not use `Closes` — let the user decide when to close issues manually
 
 - List every changed file with a short explanation of what was modified and the reason
 - All CI checks must pass before merge
