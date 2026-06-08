@@ -76,11 +76,39 @@ handlers into api/kv.rs following the existing module pattern.
 - `chore/<task>` — Tooling/config (e.g., `chore/claude-config`)
 - `docs/<area>` — Documentation (e.g., `docs/architecture`)
 
+## Commit Author
+
+- Never include `Co-Authored-By` or any AI attribution in commit messages
+- Commits are authored by the human user only
+
 ## PR Conventions
 
 - One logical change per PR
 - PR title follows commit message format
-- PR body must include: Summary, Motivation, Test Plan
+- PR body format:
+
+```markdown
+## Summary
+
+Brief description of what this PR does and why.
+
+## Changes
+
+- **path/to/file.rs** — What changed and why.
+- **path/to/other.rs** — What changed and why.
+
+## Testing
+
+Describe any tests added or modified. Skip this section if no test changes.
+
+## How to verify
+
+Steps to verify the changes work correctly, e.g.:
+- Commands to run (cargo build, cargo test, etc.)
+- Manual verification steps if applicable
+```
+
+- List every changed file with a short explanation of what was modified and the reason
 - All CI checks must pass before merge
 - `cargo clippy -- -D warnings` must pass
 - No `unsafe` code without explicit justification
