@@ -1,0 +1,123 @@
+use serde::Deserialize;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AetherConfig {
+    #[serde(default = "default_node_id")]
+    pub node_id: u64,
+
+    #[serde(default = "default_addr")]
+    pub addr: String,
+
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
+    #[serde(default)]
+    pub auth: AuthConfig,
+
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_ms: u64,
+
+    #[serde(default = "default_election_timeout")]
+    pub election_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerConfig {
+    pub node_id: u64,
+    pub addr: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_token_expiry")]
+    pub token_expiry_hours: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+
+    #[serde(default)]
+    pub json: bool,
+}
+
+fn default_node_id() -> u64 {
+    1
+}
+
+fn default_addr() -> String {
+    "127.0.0.1:2379".to_string()
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("/tmp/aether")
+}
+
+fn default_heartbeat_interval() -> u64 {
+    1000
+}
+
+fn default_election_timeout() -> u64 {
+    10000
+}
+
+fn default_token_expiry() -> u64 {
+    24
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            heartbeat_interval_ms: default_heartbeat_interval(),
+            election_timeout_ms: default_election_timeout(),
+        }
+    }
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_expiry_hours: default_token_expiry(),
+        }
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            json: false,
+        }
+    }
+}
+
+impl AetherConfig {
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config: AetherConfig = toml::from_str(&content)?;
+        Ok(config)
+    }
+}
