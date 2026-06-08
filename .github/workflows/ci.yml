@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 1
+  RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'proto/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'build.rs'
+              - '.github/workflows/ci.yml'
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt -- --check
+
+  build:
+    name: Build (${{ matrix.runner }})
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-latest-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+      - run: cargo build --all-targets
+
+  build-nightly:
+    name: Build (${{ matrix.runner }}, nightly)
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-latest-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+      - run: cargo build --all-targets
+
+  clippy:
+    name: Clippy
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: Linux-X64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.runner }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-latest-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+
+  proto:
+    name: Proto Compilation
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: Linux-X64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+      - run: cargo build
+      - run: git diff --exit-code src/generated/
+
+  ci-required:
+    name: CI Required
+    if: always()
+    needs: [changes, fmt, clippy, test, proto]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          # fmt is always required
+          if [ "${{ needs.fmt.result }}" != "success" ]; then
+            echo "Format check failed"
+            exit 1
+          fi
+          # code checks are only required when code changes
+          if [ "${{ needs.changes.outputs.code }}" == "true" ]; then
+            if [ "${{ needs.clippy.result }}" != "success" ] || \
+               [ "${{ needs.test.result }}" != "success" ] || \
+               [ "${{ needs.proto.result }}" != "success" ]; then
+              echo "Code checks failed"
+              exit 1
+            fi
+          fi
+          echo "All checks passed"

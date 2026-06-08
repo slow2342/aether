@@ -23,16 +23,17 @@ env:
 
 ```yaml
 build:
-  strategy:
-    matrix:
-      os: [ubuntu-latest, macos-latest]
-      rust: [stable, nightly]
+  runs-on: ubuntu-latest
   steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: true
     - run: cargo build --all-targets
 ```
+
+Build is Linux-only (x86_64 + aarch64). macOS is not tested — production runs on Linux.
 
 ### 2. Test
 
@@ -66,7 +67,7 @@ fmt:
 ```yaml
 audit:
   steps:
-    - uses: rustsec/audit-check@v1
+    - uses: rustsec/audit-check@v2.0.0
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -98,7 +99,7 @@ proto:
 | Check | Must Pass | Block Merge |
 |-------|-----------|-------------|
 | build (stable, linux) | Yes | Yes |
-| build (stable, macos) | Yes | Yes |
+| build (aarch64) | Yes | Yes |
 | test | Yes | Yes |
 | clippy | Yes (0 warnings) | Yes |
 | fmt | Yes | Yes |
@@ -131,7 +132,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
-      - uses: softprops/action-gh-release@v1
+      - uses: softprops/action-gh-release@v2
         with:
           files: target/release/aether
           generate_release_notes: true
