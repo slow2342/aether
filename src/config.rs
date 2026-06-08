@@ -114,6 +114,19 @@ impl Default for LogConfig {
     }
 }
 
+impl Default for AetherConfig {
+    fn default() -> Self {
+        Self {
+            node_id: default_node_id(),
+            addr: default_addr(),
+            data_dir: default_data_dir(),
+            cluster: ClusterConfig::default(),
+            auth: AuthConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
+}
+
 impl AetherConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
