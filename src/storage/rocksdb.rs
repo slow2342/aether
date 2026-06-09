@@ -1,31 +1,42 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
 
 use super::{KvPair, StorageEngine, WriteOp};
 use crate::error::StorageError;
 
+/// Column families used by the storage engine
+const COLUMN_FAMILIES: &[&str] = &["default", "raft_log", "raft_state"];
+
 /// RocksDB storage engine implementation
 pub struct RocksStorage {
-    db: DB,
+    db: Arc<DB>,
 }
 
 impl RocksStorage {
-    /// Open a new RocksDB storage engine
+    /// Open a new RocksDB storage engine with all required column families
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
-        let db = DB::open(&opts, path).map_err(StorageError::RocksDb)?;
+        let db = DB::open_cf(&opts, path, COLUMN_FAMILIES).map_err(StorageError::RocksDb)?;
 
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     /// Open with custom options
-    pub fn open_with_options(path: &Path, opts: Options) -> Result<Self, StorageError> {
-        let db = DB::open(&opts, path).map_err(StorageError::RocksDb)?;
-        Ok(Self { db })
+    pub fn open_with_options(path: &Path, mut opts: Options) -> Result<Self, StorageError> {
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf(&opts, path, COLUMN_FAMILIES).map_err(StorageError::RocksDb)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Get a reference to the underlying RocksDB instance
+    pub fn db(&self) -> &Arc<DB> {
+        &self.db
     }
 }
 

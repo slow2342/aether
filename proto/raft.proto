@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package raft;
+
+// RaftRPC provides internal Raft RPCs between cluster nodes.
+// Payloads are serde_json-serialized openraft types.
+service RaftRPC {
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc Vote(VoteRequest) returns (VoteResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message AppendEntriesRequest {
+    bytes payload = 1;
+}
+
+message AppendEntriesResponse {
+    bytes payload = 1;
+}
+
+message VoteRequest {
+    bytes payload = 1;
+}
+
+message VoteResponse {
+    bytes payload = 1;
+}
+
+message InstallSnapshotRequest {
+    bytes payload = 1;
+}
+
+message InstallSnapshotResponse {
+    bytes payload = 1;
+}

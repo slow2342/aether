@@ -10,6 +10,12 @@ pub enum AetherError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("not leader, leader address: {leader:?}")]
+    NotLeader { leader: Option<String> },
+
+    #[error("raft error: {0}")]
+    Raft(String),
 }
 
 #[derive(Debug, Error)]
