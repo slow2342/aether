@@ -1,0 +1,170 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherKV provides key-value operations.
+service AetherKV {
+    // Put puts the given key into the store.
+    rpc Put(PutRequest) returns (PutResponse);
+
+    // Get gets the key or a range of keys from the store.
+    rpc Get(GetRequest) returns (GetResponse);
+
+    // Delete deletes the given key or range of keys from the store.
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+    // Range gets the keys in the range [key, range_end).
+    rpc Range(RangeRequest) returns (RangeResponse);
+
+    // Txn processes multiple operations in a single transaction.
+    rpc Txn(TxnRequest) returns (TxnResponse);
+}
+
+message PutRequest {
+    bytes key = 1;
+    bytes value = 2;
+    // lease is the lease ID to attach to the key, 0 = no lease.
+    int64 lease = 3;
+    // prev_kv returns the previous key-value pair if true.
+    bool prev_kv = 4;
+}
+
+message PutResponse {
+    ResponseHeader header = 1;
+    // prev_kv is the previous key-value pair, set only if prev_kv was true.
+    KeyValue prev_kv = 2;
+}
+
+message GetRequest {
+    bytes key = 1;
+    // range_end is the upper bound of the range [key, range_end).
+    // Empty means single key lookup.
+    bytes range_end = 2;
+    // limit is the maximum number of keys to return, 0 = no limit.
+    int64 limit = 3;
+    // revision is the point-in-time revision to read, 0 = latest.
+    int64 revision = 4;
+    // serializable enables serializable reads (may read stale data).
+    bool serializable = 5;
+    SortOrder sort_order = 6;
+    SortTarget sort_target = 7;
+}
+
+message GetResponse {
+    ResponseHeader header = 1;
+    repeated KeyValue kvs = 2;
+    // count is the total number of keys in the range.
+    int64 count = 3;
+}
+
+message DeleteRequest {
+    bytes key = 1;
+    // range_end is the upper bound of the range [key, range_end).
+    // Empty means single key delete.
+    bytes range_end = 2;
+    // prev_kv returns the deleted key-value pairs if true.
+    bool prev_kv = 3;
+}
+
+message DeleteResponse {
+    ResponseHeader header = 1;
+    // deleted is the number of keys deleted.
+    int64 deleted = 2;
+    // prev_kvs contains the deleted key-value pairs, set only if prev_kv was true.
+    repeated KeyValue prev_kvs = 3;
+}
+
+// RangeRequest gets the keys in the range [key, range_end).
+message RangeRequest {
+    bytes key = 1;
+    // range_end is the upper bound of the range [key, range_end).
+    // If range_end is "\0", it returns all keys from key to end of keyspace.
+    // If range_end is empty, it returns only the key.
+    bytes range_end = 2;
+    // limit is the maximum number of keys to return, 0 = no limit.
+    int64 limit = 3;
+    // revision is the point-in-time revision to read, 0 = latest.
+    int64 revision = 4;
+    SortOrder sort_order = 5;
+    SortTarget sort_target = 6;
+}
+
+message RangeResponse {
+    ResponseHeader header = 1;
+    repeated KeyValue kvs = 2;
+    // count is the total number of keys in the range.
+    int64 count = 3;
+}
+
+// --- Transaction types ---
+
+// CompareResult defines the comparison result.
+enum CompareResult {
+    COMPARE_RESULT_EQUAL = 0;
+    COMPARE_RESULT_GREATER = 1;
+    COMPARE_RESULT_LESS = 2;
+    COMPARE_RESULT_NOT_EQUAL = 3;
+}
+
+// CompareTarget defines what to compare.
+enum CompareTarget {
+    COMPARE_TARGET_VERSION = 0;
+    COMPARE_TARGET_CREATE = 1;
+    COMPARE_TARGET_MOD = 2;
+    COMPARE_TARGET_VALUE = 3;
+    COMPARE_TARGET_LEASE = 4;
+}
+
+// Compare defines a comparison condition for a transaction.
+message Compare {
+    CompareResult result = 1;
+    CompareTarget target = 2;
+    bytes key = 3;
+    oneof target_union {
+        int64 version = 4;
+        int64 create_revision = 5;
+        int64 mod_revision = 6;
+        bytes value = 7;
+        int64 lease = 8;
+    }
+}
+
+// RequestOp is a single operation within a transaction.
+message RequestOp {
+    oneof request {
+        PutRequest put = 1;
+        GetRequest get = 2;
+        DeleteRequest delete = 3;
+        RangeRequest range = 4;
+    }
+}
+
+// ResponseOp is the response for a single operation within a transaction.
+message ResponseOp {
+    oneof response {
+        PutResponse put = 1;
+        GetResponse get = 2;
+        DeleteResponse delete = 3;
+        RangeResponse range = 4;
+    }
+}
+
+// TxnRequest processes multiple operations in a single transaction.
+message TxnRequest {
+    // compare is the list of conditions that must all be true for success.
+    repeated Compare compare = 1;
+    // success is the list of operations to execute if all compares succeed.
+    repeated RequestOp success = 2;
+    // failure is the list of operations to execute if any compare fails.
+    repeated RequestOp failure = 3;
+}
+
+message TxnResponse {
+    ResponseHeader header = 1;
+    // succeeded is true if all compares succeeded.
+    bool succeeded = 2;
+    // responses contains the results of the executed operations.
+    repeated ResponseOp responses = 3;
+}

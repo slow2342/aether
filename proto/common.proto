@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package aether;
+
+// ResponseHeader is included in every response with cluster metadata.
+message ResponseHeader {
+    uint64 cluster_id = 1;
+    uint64 member_id = 2;
+    // Current store revision when response was created.
+    int64 revision = 3;
+    uint64 raft_term = 4;
+}
+
+// KeyValue represents a key-value pair with metadata.
+message KeyValue {
+    bytes key = 1;
+    bytes value = 2;
+    int64 create_revision = 3;
+    int64 mod_revision = 4;
+    int64 version = 5;
+    int64 lease = 6;
+}
+
+// SortOrder defines the sort order for Range results.
+enum SortOrder {
+    SORT_ORDER_NONE = 0;
+    SORT_ORDER_ASCEND = 1;
+    SORT_ORDER_DESCEND = 2;
+}
+
+// SortTarget defines the field to sort on.
+enum SortTarget {
+    SORT_TARGET_KEY = 0;
+    SORT_TARGET_VERSION = 1;
+    SORT_TARGET_CREATE = 2;
+    SORT_TARGET_MOD = 3;
+    SORT_TARGET_VALUE = 4;
+}
+
+// WatchEvent represents a single watch event.
+message WatchEvent {
+    WatchEventType event_type = 1;
+    KeyValue kv = 2;
+    KeyValue prev_kv = 3;
+}
+
+// WatchEventType is the type of a watch event.
+enum WatchEventType {
+    WATCH_EVENT_TYPE_PUT = 0;
+    WATCH_EVENT_TYPE_DELETE = 1;
+}
+
+// LeaseInfo contains lease metadata.
+message LeaseInfo {
+    int64 id = 1;
+    int64 ttl = 2;
+    int64 granted_ttl = 3;
+    repeated bytes keys = 4;
+}

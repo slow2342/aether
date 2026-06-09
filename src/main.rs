@@ -1,8 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
+use tonic::transport::Server;
 
+use aether::api::KvService;
 use aether::config::AetherConfig;
+use aether::proto::aether_kv_server::AetherKvServer;
 use aether::storage::RocksStorage;
 
 #[derive(Parser, Debug)]
@@ -60,10 +64,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize storage
-    let _storage = RocksStorage::open(&config.data_dir)?;
+    let storage = Arc::new(RocksStorage::open(&config.data_dir)?);
     tracing::info!("Storage initialized");
 
-    // TODO: start Raft, start gRPC server
+    // Start gRPC server
+    let addr = config.addr.parse()?;
+    let kv_service = KvService::new(storage);
+    let svc = AetherKvServer::new(kv_service);
+
+    tracing::info!(addr = %config.addr, "Starting gRPC server");
+    Server::builder().add_service(svc).serve(addr).await?;
 
     tracing::info!("Aether stopped");
     Ok(())
