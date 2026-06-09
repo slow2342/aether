@@ -74,4 +74,29 @@ impl StorageEngine for RocksStorage {
 
         self.db.write(batch).map_err(StorageError::RocksDb)
     }
+
+    fn range_scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<KvPair>, StorageError> {
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(start, Direction::Forward));
+
+        for item in iter {
+            let (key, value) = item.map_err(StorageError::RocksDb)?;
+            if (!end.is_empty() && key.as_ref() >= end) || results.len() >= limit {
+                break;
+            }
+            results.push(KvPair {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            });
+        }
+
+        Ok(results)
+    }
 }

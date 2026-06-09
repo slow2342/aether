@@ -29,9 +29,20 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// Delete a key
     fn delete(&self, key: &[u8]) -> Result<(), StorageError>;
 
-    /// Scan keys with prefix, up to limit
+    /// Scan keys with prefix, up to limit.
+    /// limit=0 returns nothing; use usize::MAX for unlimited.
     fn scan(&self, prefix: &[u8], limit: usize) -> Result<Vec<KvPair>, StorageError>;
 
     /// Atomic batch write
     fn batch_write(&self, ops: Vec<WriteOp>) -> Result<(), StorageError>;
+
+    /// Scan keys in range [start, end), up to limit.
+    /// If end is empty, scan to end of keyspace.
+    /// limit=0 returns nothing; use usize::MAX for unlimited.
+    fn range_scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<KvPair>, StorageError>;
 }
