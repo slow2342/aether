@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherWatch provides watch operations for key change notifications.
+service AetherWatch {
+    // Watch creates a watch stream. The client sends WatchRequests to
+    // create/cancel watches, and receives WatchResponses with events.
+    rpc Watch(stream WatchRequest) returns (stream WatchResponse);
+}
+
+// WatchRequest is sent by the client on the watch stream.
+message WatchRequest {
+    oneof request {
+        WatchCreateRequest create = 1;
+        WatchCancelRequest cancel = 2;
+    }
+}
+
+// WatchCreateRequest creates a new watch.
+message WatchCreateRequest {
+    // key is the key to watch.
+    bytes key = 1;
+    // range_end is the upper bound of the range [key, range_end).
+    // Empty means watch a single key. "\0" means watch all keys from key.
+    bytes range_end = 2;
+    // filters filters events by type. Empty means all event types.
+    repeated WatchEventType filters = 3;
+    // prev_kv requests the previous key-value pair in watch events.
+    bool prev_kv = 4;
+}
+
+// WatchCancelRequest cancels an existing watch.
+message WatchCancelRequest {
+    // watch_id is the ID of the watch to cancel.
+    int64 watch_id = 1;
+}
+
+// WatchResponse is sent by the server on the watch stream.
+message WatchResponse {
+    // watch_id is the ID of the watch that generated this response.
+    int64 watch_id = 1;
+    // created is set to true on the first response after a watch is created.
+    bool created = 2;
+    // events is the list of events that triggered this response.
+    repeated WatchEvent events = 3;
+    // canceled is set to true when the watch is canceled.
+    bool canceled = 4;
+    // cancel_reason is the reason the watch was canceled.
+    string cancel_reason = 5;
+    // header is included in the first response (created) with cluster metadata.
+    ResponseHeader header = 6;
+}

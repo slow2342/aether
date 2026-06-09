@@ -5,10 +5,11 @@ use std::sync::Arc;
 use clap::Parser;
 use tonic::transport::Server;
 
-use aether::api::{ClusterService, KvService};
+use aether::api::{ClusterService, KvService, WatchService};
 use aether::config::AetherConfig;
 use aether::proto::aether_cluster_server::AetherClusterServer;
 use aether::proto::aether_kv_server::AetherKvServer;
+use aether::proto::aether_watch_server::AetherWatchServer;
 use aether::proto::raft_rpc::raft_rpc_server::RaftRpcServer;
 use aether::raft::log_store::AetherLogStore;
 use aether::raft::network::AetherNetwork;
@@ -16,6 +17,7 @@ use aether::raft::rpc::RaftRpcImpl;
 use aether::raft::state_machine::AetherStateMachine;
 use aether::raft::{RaftNode, TypeConfig, WatchEvent};
 use aether::storage::RocksStorage;
+use aether::watch::WatchManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "aether", about = "A distributed key-value store")]
@@ -80,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create state machine
     let (watch_tx, _watch_rx) = tokio::sync::broadcast::channel::<WatchEvent>(1024);
-    let state_machine = AetherStateMachine::new(watch_tx);
+    let state_machine = AetherStateMachine::new(watch_tx.clone(), storage.clone());
 
     // Build Raft config
     let raft_config = Arc::new(openraft::Config {
@@ -142,7 +144,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create services
-    let kv_service = KvService::new(storage);
+    let watch_manager = WatchManager::new(watch_tx);
+    let watch_service = WatchService::new(watch_manager);
+    let kv_service = KvService::new(storage, raft.clone(), config.node_id);
     let cluster_service = ClusterService::new(raft.clone(), config.node_id);
     let raft_rpc_service = RaftRpcImpl::new(raft);
 
@@ -152,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
 
     Server::builder()
         .add_service(AetherKvServer::new(kv_service))
+        .add_service(AetherWatchServer::new(watch_service))
         .add_service(AetherClusterServer::new(cluster_service))
         .add_service(RaftRpcServer::new(raft_rpc_service))
         .serve(addr)

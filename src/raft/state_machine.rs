@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use openraft::storage::RaftStateMachine;
@@ -7,24 +6,29 @@ use openraft::{
     StoredMembership,
 };
 
+use std::sync::Arc;
+
 use super::{RaftNode, RaftRequest, RaftResponse, TypeConfig, WatchEvent};
+use crate::storage::{RocksStorage, StorageEngine};
 
 /// Snapshot data persisted on disk
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotData {
     pub last_applied: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, RaftNode>,
-    pub data: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub data: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// Aether state machine implementation
+/// Aether state machine implementation.
+/// All user data is stored in RocksDB. The BTreeMap was removed in favor of
+/// a single source of truth in the storage engine.
 pub struct AetherStateMachine {
     /// Applied log index
     pub last_applied: Option<LogId<u64>>,
     /// Last membership config
     pub last_membership: StoredMembership<u64, RaftNode>,
-    /// Storage engine for user data (in-memory for now, will be replaced with RocksDB)
-    pub data: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// RocksDB storage for persistent user data
+    pub storage: Arc<RocksStorage>,
     /// Watch event notifier
     pub watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
     /// Current snapshot data
@@ -33,14 +37,31 @@ pub struct AetherStateMachine {
 
 impl AetherStateMachine {
     /// Create a new state machine
-    pub fn new(watch_tx: tokio::sync::broadcast::Sender<WatchEvent>) -> Self {
+    pub fn new(
+        watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
+        storage: Arc<RocksStorage>,
+    ) -> Self {
         Self {
             last_applied: None,
             last_membership: StoredMembership::default(),
-            data: BTreeMap::new(),
+            storage,
             watch_tx,
             current_snapshot: None,
         }
+    }
+
+    /// Read a key from storage, returning None on error.
+    fn storage_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.storage.get(key).ok().flatten()
+    }
+
+    /// Read a range from storage, returning empty vec on error.
+    fn storage_range(&self, key: &[u8], range_end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let end = if range_end == b"\0" { &[] } else { range_end };
+        self.storage
+            .range_scan(key, end, usize::MAX)
+            .map(|kvs| kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
+            .unwrap_or_default()
     }
 
     /// Apply a request to the state machine
@@ -51,15 +72,19 @@ impl AetherStateMachine {
                 value,
                 lease_id,
             } => {
-                let prev_kv = self.data.get(&key).map(|v| super::KeyValue {
+                let prev_kv = self.storage_get(&key).map(|v| super::KeyValue {
                     key: key.clone(),
-                    value: v.clone(),
+                    value: v,
                     create_revision: 0,
                     mod_revision: 0,
                     version: 0,
                     lease: 0,
                 });
-                self.data.insert(key.clone(), value.clone());
+                if let Err(e) = self.storage.put(&key, &value) {
+                    tracing::error!(error = %e, "failed to put to storage");
+                    // Don't send watch event on storage failure.
+                    return RaftResponse::Put { prev_kv: None };
+                }
 
                 let _ = self.watch_tx.send(WatchEvent {
                     event_type: super::WatchEventType::Put,
@@ -81,41 +106,53 @@ impl AetherStateMachine {
                 let prev_kvs;
 
                 if range_end.is_empty() {
-                    if let Some(value) = self.data.remove(&key) {
-                        deleted = 1;
-                        prev_kvs = vec![super::KeyValue {
-                            key: key.clone(),
-                            value,
-                            create_revision: 0,
-                            mod_revision: 0,
-                            version: 0,
-                            lease: 0,
-                        }];
-                    } else {
-                        deleted = 0;
-                        prev_kvs = vec![];
-                    }
-                } else {
-                    let keys_to_delete: Vec<Vec<u8>> = if range_end == b"\0" {
-                        self.data.range(key.clone()..)
-                    } else {
-                        self.data.range(key.clone()..range_end)
-                    }
-                    .map(|(k, _)| k.clone())
-                    .collect();
-
-                    deleted = keys_to_delete.len() as i64;
-                    prev_kvs = keys_to_delete
-                        .iter()
-                        .filter_map(|k| {
-                            self.data.remove(k).map(|v| super::KeyValue {
-                                key: k.clone(),
-                                value: v,
+                    match self.storage_get(&key) {
+                        Some(value) => {
+                            if let Err(e) = self.storage.delete(&key) {
+                                tracing::error!(error = %e, "failed to delete from storage");
+                                return RaftResponse::Delete {
+                                    deleted: 0,
+                                    prev_kvs: vec![],
+                                };
+                            }
+                            deleted = 1;
+                            prev_kvs = vec![super::KeyValue {
+                                key: key.clone(),
+                                value,
                                 create_revision: 0,
                                 mod_revision: 0,
                                 version: 0,
                                 lease: 0,
-                            })
+                            }];
+                        }
+                        None => {
+                            deleted = 0;
+                            prev_kvs = vec![];
+                        }
+                    }
+                } else {
+                    let pairs = self.storage_range(&key, &range_end);
+                    let ops: Vec<_> = pairs
+                        .iter()
+                        .map(|(k, _)| crate::storage::WriteOp::Delete { key: k.clone() })
+                        .collect();
+                    if let Err(e) = self.storage.batch_write(ops) {
+                        tracing::error!(error = %e, "failed to batch delete from storage");
+                        return RaftResponse::Delete {
+                            deleted: 0,
+                            prev_kvs: vec![],
+                        };
+                    }
+                    deleted = pairs.len() as i64;
+                    prev_kvs = pairs
+                        .into_iter()
+                        .map(|(k, v)| super::KeyValue {
+                            key: k,
+                            value: v,
+                            create_revision: 0,
+                            mod_revision: 0,
+                            version: 0,
+                            lease: 0,
                         })
                         .collect();
                 }
@@ -136,22 +173,26 @@ impl AetherStateMachine {
                 failure,
             } => {
                 let succeeded = compare.iter().all(|cmp| {
-                    let current_value = self.data.get(&cmp.key);
+                    let current_value = self.storage_get(&cmp.key);
                     match (&cmp.target, &cmp.target_union) {
                         (super::CompareTarget::Value, super::TargetUnion::Value(expected)) => {
                             match cmp.result {
-                                super::CompareResult::Equal => current_value == Some(expected),
-                                super::CompareResult::NotEqual => current_value != Some(expected),
-                                super::CompareResult::Greater => {
-                                    current_value.is_some_and(|v| v > expected)
+                                super::CompareResult::Equal => {
+                                    current_value.as_deref() == Some(expected.as_slice())
                                 }
-                                super::CompareResult::Less => {
-                                    current_value.is_some_and(|v| v < expected)
+                                super::CompareResult::NotEqual => {
+                                    current_value.as_deref() != Some(expected.as_slice())
                                 }
+                                super::CompareResult::Greater => current_value
+                                    .as_deref()
+                                    .is_some_and(|v| v > expected.as_slice()),
+                                super::CompareResult::Less => current_value
+                                    .as_deref()
+                                    .is_some_and(|v| v < expected.as_slice()),
                             }
                         }
                         // Version/Create/Mod/Lease comparisons require MVCC metadata,
-                        // which the in-memory store does not yet support. Fail safe.
+                        // which is not yet supported. Fail safe.
                         _ => false,
                     }
                 });
@@ -192,39 +233,24 @@ impl AetherStateMachine {
                             }
                             super::Request::Get(get) => {
                                 let kvs = if get.range_end.is_empty() {
-                                    // Single key
-                                    self.data
-                                        .get(&get.key)
-                                        .map(|v| {
-                                            vec![super::KeyValue {
-                                                key: get.key.clone(),
-                                                value: v.clone(),
-                                                create_revision: 0,
-                                                mod_revision: 0,
-                                                version: 0,
-                                                lease: 0,
-                                            }]
-                                        })
-                                        .unwrap_or_default()
-                                } else if get.range_end == b"\0" {
-                                    // All keys from key to end of keyspace
-                                    self.data
-                                        .range(get.key.clone()..)
-                                        .map(|(k, v)| super::KeyValue {
-                                            key: k.clone(),
-                                            value: v.clone(),
+                                    match self.storage_get(&get.key) {
+                                        Some(value) => vec![super::KeyValue {
+                                            key: get.key.clone(),
+                                            value,
                                             create_revision: 0,
                                             mod_revision: 0,
                                             version: 0,
                                             lease: 0,
-                                        })
-                                        .collect()
+                                        }],
+                                        None => vec![],
+                                    }
                                 } else {
-                                    self.data
-                                        .range(get.key.clone()..get.range_end.clone())
+                                    let pairs = self.storage_range(&get.key, &get.range_end);
+                                    pairs
+                                        .into_iter()
                                         .map(|(k, v)| super::KeyValue {
-                                            key: k.clone(),
-                                            value: v.clone(),
+                                            key: k,
+                                            value: v,
                                             create_revision: 0,
                                             mod_revision: 0,
                                             version: 0,
@@ -236,21 +262,25 @@ impl AetherStateMachine {
                                 super::Response::Get(super::RangeResponse { kvs, count })
                             }
                             super::Request::Range(range) => {
-                                let kvs = if range.range_end == b"\0" {
-                                    // All keys from key to end of keyspace
-                                    self.data.range(range.key.clone()..)
+                                let pairs = if range.range_end.is_empty() {
+                                    match self.storage_get(&range.key) {
+                                        Some(value) => vec![(range.key.clone(), value)],
+                                        None => vec![],
+                                    }
                                 } else {
-                                    self.data.range(range.key.clone()..range.range_end.clone())
-                                }
-                                .map(|(k, v)| super::KeyValue {
-                                    key: k.clone(),
-                                    value: v.clone(),
-                                    create_revision: 0,
-                                    mod_revision: 0,
-                                    version: 0,
-                                    lease: 0,
-                                })
-                                .collect::<Vec<_>>();
+                                    self.storage_range(&range.key, &range.range_end)
+                                };
+                                let kvs: Vec<_> = pairs
+                                    .into_iter()
+                                    .map(|(k, v)| super::KeyValue {
+                                        key: k,
+                                        value: v,
+                                        create_revision: 0,
+                                        mod_revision: 0,
+                                        version: 0,
+                                        lease: 0,
+                                    })
+                                    .collect();
                                 let count = kvs.len() as i64;
                                 super::Response::Range(super::RangeResponse { kvs, count })
                             }
@@ -274,10 +304,23 @@ impl AetherStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for AetherStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+        // Read all user data from RocksDB for the snapshot.
+        let kvs = self.storage.range_scan(&[], &[], usize::MAX).map_err(|e| {
+            tracing::error!(error = %e, "failed to read storage for snapshot");
+            StorageError::IO {
+                source: openraft::StorageIOError::new(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Read,
+                    openraft::AnyError::new(&e),
+                ),
+            }
+        })?;
+        let data: Vec<(Vec<u8>, Vec<u8>)> = kvs.into_iter().map(|kv| (kv.key, kv.value)).collect();
+
         let snapshot_data = SnapshotData {
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
-            data: self.data.clone(),
+            data,
         };
 
         let data = serde_json::to_vec(&snapshot_data).map_err(|e| StorageError::IO {
@@ -339,7 +382,7 @@ impl RaftStateMachine<TypeConfig> for AetherStateMachine {
         AetherStateMachine {
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
-            data: self.data.clone(),
+            storage: self.storage.clone(),
             watch_tx: self.watch_tx.clone(),
             current_snapshot: None,
         }
@@ -367,8 +410,37 @@ impl RaftStateMachine<TypeConfig> for AetherStateMachine {
 
         self.last_applied = snapshot_data.last_applied;
         self.last_membership = meta.last_membership.clone();
-        self.data = snapshot_data.data;
         self.current_snapshot = Some(snapshot.into_inner());
+
+        // Clear existing user data in RocksDB before writing snapshot.
+        // This removes stale keys that are not in the snapshot.
+        self.storage.clear_default_cf().map_err(|e| {
+            tracing::error!(error = %e, "failed to clear storage before snapshot restore");
+            StorageError::IO {
+                source: openraft::StorageIOError::new(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Write,
+                    openraft::AnyError::new(&e),
+                ),
+            }
+        })?;
+
+        // Write snapshot data to RocksDB.
+        let ops: Vec<_> = snapshot_data
+            .data
+            .into_iter()
+            .map(|(k, v)| crate::storage::WriteOp::Put { key: k, value: v })
+            .collect();
+        self.storage.batch_write(ops).map_err(|e| {
+            tracing::error!(error = %e, "failed to sync snapshot to storage");
+            StorageError::IO {
+                source: openraft::StorageIOError::new(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Write,
+                    openraft::AnyError::new(&e),
+                ),
+            }
+        })?;
 
         Ok(())
     }
