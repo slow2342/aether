@@ -38,6 +38,19 @@ impl RocksStorage {
     pub fn db(&self) -> &Arc<DB> {
         &self.db
     }
+
+    /// Clear all user data from the default column family.
+    /// Used during snapshot restore to remove stale keys not in the snapshot.
+    pub fn clear_default_cf(&self) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::default();
+        let iter = self.db.iterator(IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item.map_err(StorageError::RocksDb)?;
+            batch.delete(key);
+        }
+        self.db.write(batch).map_err(StorageError::RocksDb)?;
+        Ok(())
+    }
 }
 
 impl StorageEngine for RocksStorage {
