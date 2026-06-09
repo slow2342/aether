@@ -3,7 +3,7 @@ syntax = "proto3";
 package raft;
 
 // RaftRPC provides internal Raft RPCs between cluster nodes.
-// Payloads are serde_json-serialized openraft types.
+// Payloads are protobuf-encoded raft-rs messages.
 service RaftRPC {
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
     rpc Vote(VoteRequest) returns (VoteResponse);

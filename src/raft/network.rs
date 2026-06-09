@@ -1,159 +1,120 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
-use openraft::network::RPCOption;
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
-use openraft::{RaftNetwork, RaftNetworkFactory};
+use prost011::Message as ProstMessage;
+use raft::eraftpb::{Message, MessageType};
+use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
-use super::{NodeId, RaftNode, TypeConfig};
 use crate::proto::raft_rpc as pb;
 use crate::proto::raft_rpc::raft_rpc_client::RaftRpcClient;
 
-/// Aether Raft network implementation
-pub struct AetherNetwork {
-    node_id: NodeId,
+const APPEND_ENTRIES_TIMEOUT: Duration = Duration::from_secs(5);
+const VOTE_TIMEOUT: Duration = Duration::from_secs(2);
+const INSTALL_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Shared client pool for concurrent message sending.
+type ClientPool = Arc<Mutex<std::collections::HashMap<u64, RaftRpcClient<Channel>>>>;
+
+pub struct NetworkSender {
+    msg_rx: tokio::sync::mpsc::Receiver<Vec<Message>>,
+    node_id: u64,
+    clients: ClientPool,
+    addrs: Arc<std::collections::HashMap<u64, String>>,
 }
 
-impl AetherNetwork {
-    pub fn new(node_id: NodeId) -> Self {
-        Self { node_id }
+impl NetworkSender {
+    pub fn new(
+        msg_rx: tokio::sync::mpsc::Receiver<Vec<Message>>,
+        node_id: u64,
+        addrs: std::collections::HashMap<u64, String>,
+    ) -> Self {
+        Self {
+            msg_rx,
+            node_id,
+            clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            addrs: Arc::new(addrs),
+        }
     }
-}
 
-impl RaftNetworkFactory<TypeConfig> for AetherNetwork {
-    type Network = AetherRaftNetwork;
+    pub async fn run(&mut self) {
+        tracing::info!(node_id = self.node_id, "network sender started");
+        while let Some(messages) = self.msg_rx.recv().await {
+            let futs: Vec<_> = messages
+                .into_iter()
+                .map(|msg| {
+                    let clients = self.clients.clone();
+                    let addrs = self.addrs.clone();
+                    tokio::spawn(async move { send_message(clients, addrs, msg).await })
+                })
+                .collect();
 
-    async fn new_client(&mut self, target: NodeId, node: &RaftNode) -> Self::Network {
-        tracing::debug!(
-            source = self.node_id,
-            target,
-            addr = %node.addr,
-            "creating raft network client"
-        );
-        AetherRaftNetwork {
-            target,
-            target_addr: node.addr.clone(),
-            client: None,
+            for fut in futs {
+                if let Err(e) = fut.await {
+                    tracing::warn!(node_id = self.node_id, error = %e, "failed to send raft message");
+                }
+            }
         }
     }
 }
 
-/// Raft network client for a specific target node
-pub struct AetherRaftNetwork {
-    target: NodeId,
-    target_addr: String,
-    client: Option<RaftRpcClient<Channel>>,
+async fn get_or_connect(
+    clients: &ClientPool,
+    addrs: &std::collections::HashMap<u64, String>,
+    to: u64,
+) -> Result<RaftRpcClient<Channel>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut pool = clients.lock().await;
+    if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(to) {
+        let addr = addrs
+            .get(&to)
+            .ok_or_else(|| format!("unknown target node {to}"))?;
+        let uri = format!("http://{}", addr);
+        let client = RaftRpcClient::connect(uri).await?;
+        e.insert(client);
+    }
+    pool.get(&to)
+        .cloned()
+        .ok_or_else(|| "client not found after insert".into())
 }
 
-impl AetherRaftNetwork {
-    async fn get_client(&mut self) -> Result<&mut RaftRpcClient<Channel>, NetworkError> {
-        if self.client.is_none() {
-            let uri = format!("http://{}", self.target_addr);
-            let client = RaftRpcClient::connect(uri)
+async fn send_message(
+    clients: ClientPool,
+    addrs: Arc<std::collections::HashMap<u64, String>>,
+    msg: Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let to = msg.to;
+    if to == 0 {
+        return Ok(());
+    }
+
+    let payload = msg.encode_to_vec();
+    let msg_type = MessageType::from_i32(msg.msg_type).unwrap_or(MessageType::MsgHup);
+
+    let mut client = get_or_connect(&clients, &addrs, to).await?;
+
+    match msg_type {
+        MessageType::MsgRequestVote | MessageType::MsgRequestVoteResponse => {
+            let request = tonic::Request::new(pb::VoteRequest { payload });
+            tokio::time::timeout(VOTE_TIMEOUT, client.vote(request))
                 .await
-                .map_err(|e| NetworkError::new(&e))?;
-            self.client = Some(client);
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         }
-        Ok(self.client.as_mut().unwrap())
-    }
-}
-
-impl RaftNetwork<TypeConfig> for AetherRaftNetwork {
-    async fn append_entries(
-        &mut self,
-        req: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, RaftNode, RaftError<u64>>> {
-        tracing::debug!(
-            target = self.target,
-            target_addr = %self.target_addr,
-            "sending AppendEntries"
-        );
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let payload =
-            serde_json::to_vec(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let request = tonic::Request::new(pb::AppendEntriesRequest { payload });
-
-        let response = tokio::time::timeout(Duration::from_secs(5), client.append_entries(request))
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let resp = response.into_inner();
-        serde_json::from_slice(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))
-    }
-
-    async fn vote(
-        &mut self,
-        req: VoteRequest<u64>,
-        _option: RPCOption,
-    ) -> Result<VoteResponse<u64>, RPCError<u64, RaftNode, RaftError<u64>>> {
-        tracing::debug!(
-            target = self.target,
-            target_addr = %self.target_addr,
-            "sending Vote"
-        );
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let payload =
-            serde_json::to_vec(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let request = tonic::Request::new(pb::VoteRequest { payload });
-
-        let response = tokio::time::timeout(Duration::from_secs(2), client.vote(request))
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let resp = response.into_inner();
-        serde_json::from_slice(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        req: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<u64>,
-        RPCError<u64, RaftNode, RaftError<u64, InstallSnapshotError>>,
-    > {
-        tracing::debug!(
-            target = self.target,
-            target_addr = %self.target_addr,
-            "sending InstallSnapshot"
-        );
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let payload =
-            serde_json::to_vec(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let request = tonic::Request::new(pb::InstallSnapshotRequest { payload });
-
-        let response =
-            tokio::time::timeout(Duration::from_secs(60), client.install_snapshot(request))
+        MessageType::MsgSnapshot => {
+            let request = tonic::Request::new(pb::InstallSnapshotRequest { payload });
+            tokio::time::timeout(INSTALL_SNAPSHOT_TIMEOUT, client.install_snapshot(request))
                 .await
-                .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
-                .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let resp = response.into_inner();
-        serde_json::from_slice(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        _ => {
+            let request = tonic::Request::new(pb::AppendEntriesRequest { payload });
+            tokio::time::timeout(APPEND_ENTRIES_TIMEOUT, client.append_entries(request))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
     }
+
+    Ok(())
 }

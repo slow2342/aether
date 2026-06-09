@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use openraft::Raft;
 use tonic::{Request, Response, Status};
 
 use crate::proto::aether_kv_server::AetherKv;
@@ -8,17 +7,17 @@ use crate::proto::{
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, KeyValue, PutRequest, PutResponse,
     RangeRequest, RangeResponse, ResponseHeader, TxnRequest, TxnResponse,
 };
-use crate::raft::{self, TypeConfig};
+use crate::raft::{self, RaftHandle, require_leader};
 use crate::storage::StorageEngine;
 
 pub struct KvService<S: StorageEngine> {
     storage: Arc<S>,
-    raft: Arc<Raft<TypeConfig>>,
+    raft: Arc<dyn RaftHandle>,
     node_id: u64,
 }
 
 impl<S: StorageEngine> KvService<S> {
-    pub fn new(storage: Arc<S>, raft: Arc<Raft<TypeConfig>>, node_id: u64) -> Self {
+    pub fn new(storage: Arc<S>, raft: Arc<dyn RaftHandle>, node_id: u64) -> Self {
         Self {
             storage,
             raft,
@@ -27,55 +26,20 @@ impl<S: StorageEngine> KvService<S> {
     }
 
     fn header(&self) -> ResponseHeader {
-        // TODO: populate from Raft state (cluster_id, member_id, revision, raft_term)
         ResponseHeader {
             cluster_id: 0,
-            member_id: 0,
+            member_id: self.node_id,
             revision: 0,
             raft_term: 0,
         }
     }
 
-    /// Returns `Ok(())` if this node is the leader, `Err` with leader info otherwise.
-    fn require_leader(&self) -> Result<(), Status> {
-        let rx = self.raft.metrics();
-        let metrics = rx.borrow();
-
-        match metrics.current_leader {
-            Some(id) if id == self.node_id => Ok(()),
-            Some(_) => {
-                let leader_addr = metrics.current_leader.and_then(|id| {
-                    metrics
-                        .membership_config
-                        .membership()
-                        .get_node(&id)
-                        .map(|n| n.addr.clone())
-                });
-                drop(metrics);
-
-                let mut status = Status::unavailable("not leader");
-                if let Some(addr) = leader_addr {
-                    let mut metadata = tonic::metadata::MetadataMap::new();
-                    metadata.insert(
-                        "x-aether-leader",
-                        addr.parse()
-                            .map_err(|_| Status::internal("invalid leader addr"))?,
-                    );
-                    status = Status::with_metadata(status.code(), status.message(), metadata);
-                }
-                Err(status)
-            }
-            None => Err(Status::unavailable("no leader elected")),
-        }
-    }
-
     /// Propose a write through Raft and return the response.
     async fn propose(&self, request: raft::RaftRequest) -> Result<raft::RaftResponse, Status> {
-        self.require_leader()?;
+        require_leader(self.raft.as_ref(), self.node_id)?;
         self.raft
-            .client_write(request)
+            .propose(request)
             .await
-            .map(|resp| resp.data)
             .map_err(|e| Status::internal(format!("raft write failed: {e}")))
     }
 }
@@ -118,6 +82,9 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
+        }
+        if !req.serializable {
+            require_leader(self.raft.as_ref(), self.node_id)?;
         }
 
         let kvs = if req.range_end.is_empty() {
@@ -221,6 +188,7 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
         &self,
         request: Request<RangeRequest>,
     ) -> Result<Response<RangeResponse>, Status> {
+        require_leader(self.raft.as_ref(), self.node_id)?;
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));

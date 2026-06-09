@@ -1,20 +1,20 @@
-use std::sync::Arc;
-
-use openraft::Raft;
+use prost011::Message as ProstMessage;
+use raft::eraftpb::Message;
+use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
-use super::TypeConfig;
 use crate::proto::raft_rpc as pb;
 use crate::proto::raft_rpc::raft_rpc_server::RaftRpc;
 
-/// Raft RPC server implementation
+/// Raft RPC server that receives messages from other nodes
+/// and forwards them to the event loop.
 pub struct RaftRpcImpl {
-    raft: Arc<Raft<TypeConfig>>,
+    msg_tx: mpsc::Sender<Message>,
 }
 
 impl RaftRpcImpl {
-    pub fn new(raft: Arc<Raft<TypeConfig>>) -> Self {
-        Self { raft }
+    pub fn new(msg_tx: mpsc::Sender<Message>) -> Self {
+        Self { msg_tx }
     }
 }
 
@@ -25,20 +25,15 @@ impl RaftRpc for RaftRpcImpl {
         request: Request<pb::AppendEntriesRequest>,
     ) -> Result<Response<pb::AppendEntriesResponse>, Status> {
         let req = request.into_inner();
-        let ae_req: openraft::raft::AppendEntriesRequest<TypeConfig> =
-            serde_json::from_slice(&req.payload)
-                .map_err(|e| Status::internal(format!("deserialize error: {e}")))?;
+        let msg = Message::decode(req.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode error: {e}")))?;
 
-        let resp = self
-            .raft
-            .append_entries(ae_req)
+        self.msg_tx
+            .send(msg)
             .await
-            .map_err(|e| Status::internal(format!("raft error: {e}")))?;
+            .map_err(|e| Status::internal(format!("channel error: {e}")))?;
 
-        let payload = serde_json::to_vec(&resp)
-            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
-
-        Ok(Response::new(pb::AppendEntriesResponse { payload }))
+        Ok(Response::new(pb::AppendEntriesResponse { payload: vec![] }))
     }
 
     async fn vote(
@@ -46,19 +41,15 @@ impl RaftRpc for RaftRpcImpl {
         request: Request<pb::VoteRequest>,
     ) -> Result<Response<pb::VoteResponse>, Status> {
         let req = request.into_inner();
-        let vote_req: openraft::raft::VoteRequest<u64> = serde_json::from_slice(&req.payload)
-            .map_err(|e| Status::internal(format!("deserialize error: {e}")))?;
+        let msg = Message::decode(req.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode error: {e}")))?;
 
-        let resp = self
-            .raft
-            .vote(vote_req)
+        self.msg_tx
+            .send(msg)
             .await
-            .map_err(|e| Status::internal(format!("raft error: {e}")))?;
+            .map_err(|e| Status::internal(format!("channel error: {e}")))?;
 
-        let payload = serde_json::to_vec(&resp)
-            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
-
-        Ok(Response::new(pb::VoteResponse { payload }))
+        Ok(Response::new(pb::VoteResponse { payload: vec![] }))
     }
 
     async fn install_snapshot(
@@ -66,19 +57,16 @@ impl RaftRpc for RaftRpcImpl {
         request: Request<pb::InstallSnapshotRequest>,
     ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let is_req: openraft::raft::InstallSnapshotRequest<TypeConfig> =
-            serde_json::from_slice(&req.payload)
-                .map_err(|e| Status::internal(format!("deserialize error: {e}")))?;
+        let msg = Message::decode(req.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode error: {e}")))?;
 
-        let resp = self
-            .raft
-            .install_snapshot(is_req)
+        self.msg_tx
+            .send(msg)
             .await
-            .map_err(|e| Status::internal(format!("raft error: {e}")))?;
+            .map_err(|e| Status::internal(format!("channel error: {e}")))?;
 
-        let payload = serde_json::to_vec(&resp)
-            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
-
-        Ok(Response::new(pb::InstallSnapshotResponse { payload }))
+        Ok(Response::new(pb::InstallSnapshotResponse {
+            payload: vec![],
+        }))
     }
 }

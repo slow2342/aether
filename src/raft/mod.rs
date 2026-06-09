@@ -1,34 +1,44 @@
-pub mod log_store;
+pub mod handle;
 pub mod network;
+pub mod node;
+pub mod raftrs_handle;
+pub mod raftrs_store;
 pub mod rpc;
-pub mod snapshot;
 pub mod state_machine;
 
-use std::io::Cursor;
-
-use serde::{Deserialize, Serialize};
+pub use self::handle::{RaftError, RaftHandle, require_leader};
 
 /// Node identifier type
 pub type NodeId = u64;
 
-openraft::declare_raft_types!(
-    pub TypeConfig:
-        D = RaftRequest,
-        R = RaftResponse,
-        NodeId = NodeId,
-        Node = RaftNode,
-        SnapshotData = Cursor<Vec<u8>>
-);
-
 /// Node information for cluster membership
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct RaftNode {
     pub addr: String,
     pub data: String,
 }
 
 /// Raft request types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum RaftRequest {
     /// Put a key-value pair
     Put {
@@ -51,7 +61,15 @@ pub enum RaftRequest {
 }
 
 /// Raft response types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum RaftResponse {
     Put {
         prev_kv: Option<KeyValue>,
@@ -68,10 +86,22 @@ pub enum RaftResponse {
         member: RaftNode,
     },
     MemberRemove {},
+    /// Storage error during apply
+    Error {
+        message: String,
+    },
 }
 
 /// Key-value pair
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct KeyValue {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -82,7 +112,15 @@ pub struct KeyValue {
 }
 
 /// Compare operation for transactions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct Compare {
     pub result: CompareResult,
     pub target: CompareTarget,
@@ -91,7 +129,18 @@ pub struct Compare {
 }
 
 /// Compare result
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum CompareResult {
     Equal,
     Greater,
@@ -100,7 +149,18 @@ pub enum CompareResult {
 }
 
 /// Compare target
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum CompareTarget {
     Version,
     Create,
@@ -110,7 +170,15 @@ pub enum CompareTarget {
 }
 
 /// Target union for compare operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum TargetUnion {
     Version(i64),
     CreateRevision(i64),
@@ -120,13 +188,29 @@ pub enum TargetUnion {
 }
 
 /// Request operation for transactions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct RequestOp {
     pub request: Option<Request>,
 }
 
 /// Request types for transactions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum Request {
     Put(PutRequest),
     Get(RangeRequest),
@@ -135,7 +219,15 @@ pub enum Request {
 }
 
 /// Put request
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct PutRequest {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -144,7 +236,15 @@ pub struct PutRequest {
 }
 
 /// Range request
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct RangeRequest {
     pub key: Vec<u8>,
     pub range_end: Vec<u8>,
@@ -155,7 +255,15 @@ pub struct RangeRequest {
 }
 
 /// Delete request
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct DeleteRequest {
     pub key: Vec<u8>,
     pub range_end: Vec<u8>,
@@ -163,7 +271,18 @@ pub struct DeleteRequest {
 }
 
 /// Sort order
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum SortOrder {
     None,
     Ascend,
@@ -171,7 +290,18 @@ pub enum SortOrder {
 }
 
 /// Sort target
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum SortTarget {
     Key,
     Version,
@@ -181,13 +311,29 @@ pub enum SortTarget {
 }
 
 /// Response operation for transactions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct ResponseOp {
     pub response: Option<Response>,
 }
 
 /// Response types for transactions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum Response {
     Put(PutResponse),
     Get(RangeResponse),
@@ -196,27 +342,59 @@ pub enum Response {
 }
 
 /// Put response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct PutResponse {
     pub prev_kv: Option<KeyValue>,
 }
 
 /// Range response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct RangeResponse {
     pub kvs: Vec<KeyValue>,
     pub count: i64,
 }
 
 /// Delete response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct DeleteResponse {
     pub deleted: i64,
     pub prev_kvs: Vec<KeyValue>,
 }
 
 /// Watch event for state machine notifications
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct WatchEvent {
     pub event_type: WatchEventType,
     pub kv: KeyValue,
@@ -224,14 +402,33 @@ pub struct WatchEvent {
 }
 
 /// Watch event type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum WatchEventType {
     Put,
     Delete,
 }
 
 /// Lease information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct LeaseInfo {
     pub id: i64,
     pub ttl: i64,
