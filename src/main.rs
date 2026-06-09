@@ -1,12 +1,20 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use tonic::transport::Server;
 
-use aether::api::KvService;
+use aether::api::{ClusterService, KvService};
 use aether::config::AetherConfig;
+use aether::proto::aether_cluster_server::AetherClusterServer;
 use aether::proto::aether_kv_server::AetherKvServer;
+use aether::proto::raft_rpc::raft_rpc_server::RaftRpcServer;
+use aether::raft::log_store::AetherLogStore;
+use aether::raft::network::AetherNetwork;
+use aether::raft::rpc::RaftRpcImpl;
+use aether::raft::state_machine::AetherStateMachine;
+use aether::raft::{RaftNode, TypeConfig, WatchEvent};
 use aether::storage::RocksStorage;
 
 #[derive(Parser, Debug)]
@@ -63,17 +71,91 @@ async fn main() -> anyhow::Result<()> {
         "Initializing storage"
     );
 
-    // Initialize storage
+    // Initialize storage (creates default, raft_log, raft_state CFs)
     let storage = Arc::new(RocksStorage::open(&config.data_dir)?);
     tracing::info!("Storage initialized");
 
+    // Create Raft log store sharing the same RocksDB instance
+    let log_store = AetherLogStore::new(storage.db().clone())?;
+
+    // Create state machine
+    let (watch_tx, _watch_rx) = tokio::sync::broadcast::channel::<WatchEvent>(1024);
+    let state_machine = AetherStateMachine::new(watch_tx);
+
+    // Build Raft config
+    let raft_config = Arc::new(openraft::Config {
+        cluster_name: "aether".to_string(),
+        election_timeout_min: config.cluster.election_timeout_ms,
+        election_timeout_max: config.cluster.election_timeout_ms * 2,
+        heartbeat_interval: config.cluster.heartbeat_interval_ms,
+        ..Default::default()
+    });
+
+    // Build initial member set from config
+    let mut members = BTreeMap::new();
+    members.insert(
+        config.node_id,
+        RaftNode {
+            addr: config.addr.clone(),
+            data: String::new(),
+        },
+    );
+    for peer in &config.cluster.peers {
+        members.insert(
+            peer.node_id,
+            RaftNode {
+                addr: peer.addr.clone(),
+                data: String::new(),
+            },
+        );
+    }
+
+    // Create network layer and Raft instance
+    let network = AetherNetwork::new(config.node_id);
+    let raft = Arc::new(
+        openraft::Raft::<TypeConfig>::new(
+            config.node_id,
+            raft_config,
+            network,
+            log_store,
+            state_machine,
+        )
+        .await?,
+    );
+
+    tracing::info!("Raft instance created");
+
+    // Bootstrap cluster if needed
+    match raft.initialize(members).await {
+        Ok(()) => {
+            tracing::info!("Cluster initialized");
+        }
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::InitializeError::NotAllowed(_),
+        )) => {
+            tracing::info!("Cluster already initialized, skipping bootstrap");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Cluster initialization failed");
+            return Err(anyhow::anyhow!("cluster initialization failed: {e}"));
+        }
+    }
+
+    // Create services
+    let kv_service = KvService::new(storage);
+    let cluster_service = ClusterService::new(raft.clone(), config.node_id);
+    let raft_rpc_service = RaftRpcImpl::new(raft);
+
     // Start gRPC server
     let addr = config.addr.parse()?;
-    let kv_service = KvService::new(storage);
-    let svc = AetherKvServer::new(kv_service);
-
     tracing::info!(addr = %config.addr, "Starting gRPC server");
-    Server::builder().add_service(svc).serve(addr).await?;
+
+    Server::builder()
+        .add_service(AetherKvServer::new(kv_service))
+        .add_service(AetherClusterServer::new(cluster_service))
+        .add_service(RaftRpcServer::new(raft_rpc_service))
+        .serve(addr)
+        .await?;
 
     tracing::info!("Aether stopped");
     Ok(())
