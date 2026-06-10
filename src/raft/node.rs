@@ -47,6 +47,10 @@ pub struct ConfChangeRequest {
 #[derive(Default)]
 pub struct RaftSharedState {
     pub leader_id: AtomicU64,
+    /// Last committed index seen by the event loop (for ReadIndex).
+    pub commit_index: AtomicU64,
+    /// Last applied index (updated after state machine apply, for ReadIndex wait).
+    pub applied_index: AtomicU64,
 }
 
 /// Handle to a running raft node, returned by [`start_raft_node`].
@@ -344,10 +348,20 @@ fn raft_event_loop(
 
             let committed = ready.take_committed_entries();
             if !committed.is_empty() {
+                // Track the highest committed index for ReadIndex
+                let max_committed = committed.last().map(|e| e.index).unwrap_or(0);
+                shared_state
+                    .commit_index
+                    .store(max_committed, Ordering::Release);
+
                 let mut sm = state_machine.lock().expect("state machine mutex poisoned");
                 for entry in &committed {
                     apply_entry(&mut sm, entry, &mut pending, &mut pending_conf);
                 }
+                // Update applied_index after all entries are applied
+                shared_state
+                    .applied_index
+                    .store(max_committed, Ordering::Release);
                 drop(sm);
 
                 // Persist ConfState for any conf change entries.

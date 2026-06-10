@@ -1,27 +1,39 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tonic::{Request, Response, Status};
 
+use crate::auth::{AuthInterceptor, PermissionType};
 use crate::proto::aether_kv_server::AetherKv;
 use crate::proto::{
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, KeyValue, PutRequest, PutResponse,
     RangeRequest, RangeResponse, ResponseHeader, TxnRequest, TxnResponse,
 };
-use crate::raft::{self, RaftHandle, require_leader};
+use crate::raft::{self, RaftHandle, ensure_linearizable, require_leader};
 use crate::storage::StorageEngine;
 
 pub struct KvService<S: StorageEngine> {
     storage: Arc<S>,
     raft: Arc<dyn RaftHandle>,
     node_id: u64,
+    auth_enabled: Arc<AtomicBool>,
+    auth_interceptor: Arc<AuthInterceptor>,
 }
 
 impl<S: StorageEngine> KvService<S> {
-    pub fn new(storage: Arc<S>, raft: Arc<dyn RaftHandle>, node_id: u64) -> Self {
+    pub fn new(
+        storage: Arc<S>,
+        raft: Arc<dyn RaftHandle>,
+        node_id: u64,
+        auth_enabled: Arc<AtomicBool>,
+        auth_interceptor: Arc<AuthInterceptor>,
+    ) -> Self {
         Self {
             storage,
             raft,
             node_id,
+            auth_enabled,
+            auth_interceptor,
         }
     }
 
@@ -34,6 +46,49 @@ impl<S: StorageEngine> KvService<S> {
         }
     }
 
+    /// Get the authenticated username from request extensions.
+    fn get_username(req: &Request<impl std::fmt::Debug>) -> Option<String> {
+        req.extensions().get::<String>().cloned()
+    }
+
+    /// Check permission if auth is enabled.
+    fn check_perm(
+        &self,
+        req: &Request<impl std::fmt::Debug>,
+        key: &[u8],
+        required: PermissionType,
+    ) -> Result<(), Status> {
+        if !self.auth_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let username =
+            Self::get_username(req).ok_or_else(|| Status::unauthenticated("no user in context"))?;
+        self.auth_interceptor
+            .check_permission(&username, key, required)
+    }
+
+    /// Check range permission if auth is enabled.
+    fn check_range_perm(
+        &self,
+        req: &Request<impl std::fmt::Debug>,
+        key: &[u8],
+        range_end: &[u8],
+        required: PermissionType,
+    ) -> Result<(), Status> {
+        if !self.auth_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let username =
+            Self::get_username(req).ok_or_else(|| Status::unauthenticated("no user in context"))?;
+        self.auth_interceptor
+            .check_range_permission(&username, key, range_end, required)
+    }
+
+    /// Check if a key is a reserved internal key (starts with `_aether_`).
+    fn is_reserved_key(key: &[u8]) -> bool {
+        key.starts_with(b"_aether_")
+    }
+
     /// Propose a write through Raft and return the response.
     async fn propose(&self, request: raft::RaftRequest) -> Result<raft::RaftResponse, Status> {
         require_leader(self.raft.as_ref(), self.node_id)?;
@@ -42,14 +97,40 @@ impl<S: StorageEngine> KvService<S> {
             .await
             .map_err(|e| Status::internal(format!("raft write failed: {e}")))
     }
+
+    /// Perform a linearizable read: confirm leadership, then wait until the
+    /// state machine has applied up to the commit index. This guarantees the
+    /// read reflects all previously committed entries.
+    async fn linearizable_read(&self) -> Result<(), Status> {
+        let commit_idx = ensure_linearizable(self.raft.as_ref(), self.node_id)?;
+        // Wait for state machine to catch up (poll with timeout)
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if self.raft.applied_index() >= commit_idx {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "timed out waiting for state machine to apply",
+                ));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+    }
 }
 
 #[tonic::async_trait]
 impl<S: StorageEngine> AetherKv for KvService<S> {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        self.check_perm(&request, &request.get_ref().key, PermissionType::Write)?;
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
+        }
+        if Self::is_reserved_key(&req.key) {
+            return Err(Status::permission_denied(
+                "keys starting with _aether_ are reserved",
+            ));
         }
 
         let raft_req = raft::RaftRequest::Put {
@@ -79,12 +160,23 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        // Check range permission when range_end is non-empty
+        if !request.get_ref().range_end.is_empty() {
+            self.check_range_perm(
+                &request,
+                &request.get_ref().key,
+                &request.get_ref().range_end,
+                PermissionType::Read,
+            )?;
+        } else {
+            self.check_perm(&request, &request.get_ref().key, PermissionType::Read)?;
+        }
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
         }
         if !req.serializable {
-            require_leader(self.raft.as_ref(), self.node_id)?;
+            self.linearizable_read().await?;
         }
 
         let kvs = if req.range_end.is_empty() {
@@ -143,9 +235,25 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        // Check range permission when range_end is non-empty
+        if !request.get_ref().range_end.is_empty() {
+            self.check_range_perm(
+                &request,
+                &request.get_ref().key,
+                &request.get_ref().range_end,
+                PermissionType::Write,
+            )?;
+        } else {
+            self.check_perm(&request, &request.get_ref().key, PermissionType::Write)?;
+        }
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
+        }
+        if Self::is_reserved_key(&req.key) {
+            return Err(Status::permission_denied(
+                "keys starting with _aether_ are reserved",
+            ));
         }
 
         let raft_req = raft::RaftRequest::Delete {
@@ -188,7 +296,18 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
         &self,
         request: Request<RangeRequest>,
     ) -> Result<Response<RangeResponse>, Status> {
-        require_leader(self.raft.as_ref(), self.node_id)?;
+        if self.auth_enabled.load(Ordering::Acquire) {
+            let username = Self::get_username(&request)
+                .ok_or_else(|| Status::unauthenticated("no user in context"))?;
+            let inner = request.get_ref();
+            self.auth_interceptor.check_range_permission(
+                &username,
+                &inner.key,
+                &inner.range_end,
+                PermissionType::Read,
+            )?;
+        }
+        self.linearizable_read().await?;
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
@@ -252,7 +371,79 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+        let txn_username = if self.auth_enabled.load(Ordering::Acquire) {
+            Some(
+                Self::get_username(&request)
+                    .ok_or_else(|| Status::unauthenticated("no user in context"))?,
+            )
+        } else {
+            None
+        };
         let req = request.into_inner();
+
+        if let Some(ref username) = txn_username {
+            // Check permissions per operation type
+            // Compare keys need Read permission
+            for cmp in &req.compare {
+                self.auth_interceptor
+                    .check_permission(username, &cmp.key, PermissionType::Read)?;
+            }
+            // Check reserved key protection for write operations
+            for op in req.success.iter().chain(req.failure.iter()) {
+                if let Some(r) = &op.request {
+                    match r {
+                        crate::proto::request_op::Request::Put(p) => {
+                            if Self::is_reserved_key(&p.key) {
+                                return Err(Status::permission_denied(
+                                    "keys starting with _aether_ are reserved",
+                                ));
+                            }
+                            self.auth_interceptor.check_permission(
+                                username,
+                                &p.key,
+                                PermissionType::Write,
+                            )?;
+                        }
+                        crate::proto::request_op::Request::Delete(d) => {
+                            if Self::is_reserved_key(&d.key) {
+                                return Err(Status::permission_denied(
+                                    "keys starting with _aether_ are reserved",
+                                ));
+                            }
+                            if !d.range_end.is_empty() {
+                                self.auth_interceptor.check_range_permission(
+                                    username,
+                                    &d.key,
+                                    &d.range_end,
+                                    PermissionType::Write,
+                                )?;
+                            } else {
+                                self.auth_interceptor.check_permission(
+                                    username,
+                                    &d.key,
+                                    PermissionType::Write,
+                                )?;
+                            }
+                        }
+                        crate::proto::request_op::Request::Get(g) => {
+                            self.auth_interceptor.check_permission(
+                                username,
+                                &g.key,
+                                PermissionType::Read,
+                            )?;
+                        }
+                        crate::proto::request_op::Request::Range(r) => {
+                            self.auth_interceptor.check_range_permission(
+                                username,
+                                &r.key,
+                                &r.range_end,
+                                PermissionType::Read,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
 
         let compare: Vec<raft::Compare> = req
             .compare

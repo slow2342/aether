@@ -16,6 +16,15 @@ pub enum AetherError {
 
     #[error("raft error: {0}")]
     Raft(String),
+
+    #[error("auth error: {0}")]
+    Auth(String),
+
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 #[derive(Debug, Error)]

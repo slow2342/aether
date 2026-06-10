@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rocksdb::WriteBatch;
 
 use super::{RaftRequest, RaftResponse, WatchEvent};
+use crate::auth::AuthCache;
 use crate::lease::{LeaseManager, LeaseStore};
 use crate::storage::{RocksStorage, StorageEngine};
 
@@ -23,6 +25,10 @@ pub struct AetherStateMachine {
     pub lease_manager: Arc<Mutex<LeaseManager>>,
     /// Persistent lease storage
     pub lease_store: LeaseStore,
+    /// In-memory auth cache (shared with interceptor)
+    pub auth_cache: Arc<AuthCache>,
+    /// Shared auth enabled flag (updated on AuthEnable/AuthDisable)
+    pub auth_enabled: Arc<AtomicBool>,
 }
 
 impl AetherStateMachine {
@@ -31,6 +37,8 @@ impl AetherStateMachine {
         storage: Arc<RocksStorage>,
         lease_manager: Arc<Mutex<LeaseManager>>,
         lease_store: LeaseStore,
+        auth_cache: Arc<AuthCache>,
+        auth_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             last_applied: 0,
@@ -38,6 +46,8 @@ impl AetherStateMachine {
             watch_tx,
             lease_manager,
             lease_store,
+            auth_cache,
+            auth_enabled,
         }
     }
 
@@ -349,6 +359,33 @@ impl AetherStateMachine {
             RaftRequest::LeaseKeepAlive { id, expiry_time } => {
                 self.apply_lease_keep_alive(id, expiry_time)
             }
+            RaftRequest::AuthUserAdd {
+                name,
+                password_hash,
+            } => self.apply_auth_user_add(name, password_hash),
+            RaftRequest::AuthUserDelete { name } => self.apply_auth_user_delete(name),
+            RaftRequest::AuthUserChangePassword {
+                name,
+                password_hash,
+            } => self.apply_auth_user_change_password(name, password_hash),
+            RaftRequest::AuthUserGrantRole { user, role } => {
+                self.apply_auth_user_grant_role(user, role)
+            }
+            RaftRequest::AuthUserRevokeRole { user, role } => {
+                self.apply_auth_user_revoke_role(user, role)
+            }
+            RaftRequest::AuthRoleAdd { name } => self.apply_auth_role_add(name),
+            RaftRequest::AuthRoleDelete { name } => self.apply_auth_role_delete(name),
+            RaftRequest::AuthRoleGrantPermission { role, permission } => {
+                self.apply_auth_role_grant_permission(role, permission)
+            }
+            RaftRequest::AuthRoleRevokePermission { role, permission } => {
+                self.apply_auth_role_revoke_permission(role, permission)
+            }
+            RaftRequest::AuthEnable { root_password_hash } => {
+                self.apply_auth_enable(root_password_hash)
+            }
+            RaftRequest::AuthDisable {} => self.apply_auth_disable(),
         }
     }
 
@@ -486,6 +523,469 @@ impl AetherStateMachine {
         RaftResponse::LeaseKeepAlive { ttl: granted_ttl }
     }
 
+    // --- Auth apply methods ---
+
+    fn apply_auth_user_add(&mut self, name: Vec<u8>, password_hash: Vec<u8>) -> RaftResponse {
+        let name = match String::from_utf8(name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid user name: {e}"),
+                };
+            }
+        };
+        let password_hash = match String::from_utf8(password_hash) {
+            Ok(h) => h,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid password hash: {e}"),
+                };
+            }
+        };
+        if self.auth_cache.get_user(&name).is_some() {
+            return RaftResponse::Error {
+                message: format!("user already exists: {name}"),
+            };
+        }
+        let user = crate::auth::User::new(name.clone(), password_hash);
+        let key = crate::auth::user_key(&name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&user);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_user(user);
+                RaftResponse::AuthUserAdd {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_user_delete(&mut self, name: Vec<u8>) -> RaftResponse {
+        let name = match String::from_utf8(name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid user name: {e}"),
+                };
+            }
+        };
+        if self.auth_cache.get_user(&name).is_none() {
+            return RaftResponse::Error {
+                message: format!("user not found: {name}"),
+            };
+        }
+        let key = crate::auth::user_key(&name);
+        if let Err(e) = self.storage.delete(&key) {
+            return RaftResponse::Error {
+                message: format!("storage delete failed: {e}"),
+            };
+        }
+        self.auth_cache.remove_user(&name);
+        RaftResponse::AuthUserDelete {}
+    }
+
+    fn apply_auth_user_change_password(
+        &mut self,
+        name: Vec<u8>,
+        password_hash: Vec<u8>,
+    ) -> RaftResponse {
+        let name = match String::from_utf8(name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid user name: {e}"),
+                };
+            }
+        };
+        let password_hash = match String::from_utf8(password_hash) {
+            Ok(h) => h,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid password hash: {e}"),
+                };
+            }
+        };
+        let mut user = match self.auth_cache.get_user(&name) {
+            Some(u) => u,
+            None => {
+                return RaftResponse::Error {
+                    message: format!("user not found: {name}"),
+                };
+            }
+        };
+        user.password_hash = password_hash;
+        let key = crate::auth::user_key(&name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&user);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_user(user);
+                RaftResponse::AuthUserChangePassword {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_user_grant_role(&mut self, user: Vec<u8>, role: Vec<u8>) -> RaftResponse {
+        let user_name = match String::from_utf8(user) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid user name: {e}"),
+                };
+            }
+        };
+        let role_name = match String::from_utf8(role) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid role name: {e}"),
+                };
+            }
+        };
+        let mut u = match self.auth_cache.get_user(&user_name) {
+            Some(u) => u,
+            None => {
+                return RaftResponse::Error {
+                    message: format!("user not found: {user_name}"),
+                };
+            }
+        };
+        if u.roles.contains(&role_name) {
+            return RaftResponse::Error {
+                message: format!("user already has role: {role_name}"),
+            };
+        }
+        if u.roles.len() >= 10 {
+            return RaftResponse::Error {
+                message: "max roles per user exceeded (10)".to_string(),
+            };
+        }
+        u.roles.push(role_name);
+        let key = crate::auth::user_key(&user_name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&u);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_user(u);
+                RaftResponse::AuthUserGrantRole {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_user_revoke_role(&mut self, user: Vec<u8>, role: Vec<u8>) -> RaftResponse {
+        let user_name = match String::from_utf8(user) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid user name: {e}"),
+                };
+            }
+        };
+        let role_name = match String::from_utf8(role) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid role name: {e}"),
+                };
+            }
+        };
+        let mut u = match self.auth_cache.get_user(&user_name) {
+            Some(u) => u,
+            None => {
+                return RaftResponse::Error {
+                    message: format!("user not found: {user_name}"),
+                };
+            }
+        };
+        u.roles.retain(|r| r != &role_name);
+        let key = crate::auth::user_key(&user_name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&u);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_user(u);
+                RaftResponse::AuthUserRevokeRole {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_role_add(&mut self, name: Vec<u8>) -> RaftResponse {
+        let name = match String::from_utf8(name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid role name: {e}"),
+                };
+            }
+        };
+        if self.auth_cache.get_role(&name).is_some() {
+            return RaftResponse::Error {
+                message: format!("role already exists: {name}"),
+            };
+        }
+        let role = crate::auth::Role::new(name.clone());
+        let key = crate::auth::role_key(&name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&role);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_role(role);
+                RaftResponse::AuthRoleAdd {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_role_delete(&mut self, name: Vec<u8>) -> RaftResponse {
+        let name = match String::from_utf8(name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid role name: {e}"),
+                };
+            }
+        };
+        if self.auth_cache.get_role(&name).is_none() {
+            return RaftResponse::Error {
+                message: format!("role not found: {name}"),
+            };
+        }
+        if self.auth_cache.is_role_in_use(&name) {
+            return RaftResponse::Error {
+                message: format!("role is in use by a user: {name}"),
+            };
+        }
+        let key = crate::auth::role_key(&name);
+        if let Err(e) = self.storage.delete(&key) {
+            return RaftResponse::Error {
+                message: format!("storage delete failed: {e}"),
+            };
+        }
+        self.auth_cache.remove_role(&name);
+        RaftResponse::AuthRoleDelete {}
+    }
+
+    fn apply_auth_role_grant_permission(
+        &mut self,
+        role_name: Vec<u8>,
+        permission: crate::auth::Permission,
+    ) -> RaftResponse {
+        let role_name = match String::from_utf8(role_name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid role name: {e}"),
+                };
+            }
+        };
+        let mut role = match self.auth_cache.get_role(&role_name) {
+            Some(r) => r,
+            None => {
+                return RaftResponse::Error {
+                    message: format!("role not found: {role_name}"),
+                };
+            }
+        };
+        if role.permissions.len() >= 100 {
+            return RaftResponse::Error {
+                message: "max permissions per role exceeded (100)".to_string(),
+            };
+        }
+        role.permissions.push(permission);
+        let key = crate::auth::role_key(&role_name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&role);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_role(role);
+                RaftResponse::AuthRoleGrantPermission {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_role_revoke_permission(
+        &mut self,
+        role_name: Vec<u8>,
+        permission: crate::auth::Permission,
+    ) -> RaftResponse {
+        let role_name = match String::from_utf8(role_name) {
+            Ok(n) => n,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid role name: {e}"),
+                };
+            }
+        };
+        let mut role = match self.auth_cache.get_role(&role_name) {
+            Some(r) => r,
+            None => {
+                return RaftResponse::Error {
+                    message: format!("role not found: {role_name}"),
+                };
+            }
+        };
+        role.permissions.retain(|p| {
+            p.perm_type != permission.perm_type
+                || p.key != permission.key
+                || p.range_end != permission.range_end
+        });
+        let key = crate::auth::role_key(&role_name);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&role);
+        match bytes {
+            Ok(b) => {
+                if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                    return RaftResponse::Error {
+                        message: format!("storage write failed: {e}"),
+                    };
+                }
+                self.auth_cache.insert_role(role);
+                RaftResponse::AuthRoleRevokePermission {}
+            }
+            Err(e) => RaftResponse::Error {
+                message: format!("serialize failed: {e}"),
+            },
+        }
+    }
+
+    fn apply_auth_enable(&mut self, root_password_hash: Vec<u8>) -> RaftResponse {
+        // AuthEnable is only allowed when auth is currently disabled.
+        // To change root password when auth is already on, use UserChangePassword.
+        if self.auth_enabled.load(Ordering::Acquire) {
+            return RaftResponse::Error {
+                message: "auth is already enabled".to_string(),
+            };
+        }
+
+        let root_name = "root".to_string();
+        let password_hash = match String::from_utf8(root_password_hash) {
+            Ok(h) => h,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("invalid password hash: {e}"),
+                };
+            }
+        };
+
+        // Create or update root user with the provided password
+        if let Some(mut root_user) = self.auth_cache.get_user(&root_name) {
+            // Root exists — update password hash
+            root_user.password_hash = password_hash;
+            let key = crate::auth::user_key(&root_name);
+            let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&root_user);
+            match bytes {
+                Ok(b) => {
+                    if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                        return RaftResponse::Error {
+                            message: format!("storage write failed: {e}"),
+                        };
+                    }
+                    self.auth_cache.insert_user(root_user);
+                }
+                Err(e) => {
+                    return RaftResponse::Error {
+                        message: format!("serialize failed: {e}"),
+                    };
+                }
+            }
+        } else {
+            // Root doesn't exist — create it
+            let mut root_user = crate::auth::User::new(root_name.clone(), password_hash);
+            root_user.enabled = true;
+            let key = crate::auth::user_key(&root_name);
+            let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&root_user);
+            match bytes {
+                Ok(b) => {
+                    if let Err(e) = self.storage.put(&key, b.as_ref()) {
+                        return RaftResponse::Error {
+                            message: format!("storage write failed: {e}"),
+                        };
+                    }
+                    self.auth_cache.insert_user(root_user);
+                }
+                Err(e) => {
+                    return RaftResponse::Error {
+                        message: format!("serialize failed: {e}"),
+                    };
+                }
+            }
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(
+            self.storage.default_cf(),
+            crate::auth::AUTH_ENABLED_KEY,
+            b"true",
+        );
+        batch.put_cf(
+            self.storage.default_cf(),
+            crate::auth::AUTH_BOOTSTRAPPED_KEY,
+            b"true",
+        );
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("storage write failed: {e}"),
+            };
+        }
+        // Update the shared auth_enabled flag so the interceptor takes effect immediately
+        self.auth_enabled.store(true, Ordering::Release);
+        RaftResponse::AuthEnable {}
+    }
+
+    fn apply_auth_disable(&mut self) -> RaftResponse {
+        // Idempotent: if already disabled, return success without side effects
+        if !self.auth_enabled.load(Ordering::Acquire) {
+            return RaftResponse::AuthDisable {};
+        }
+        if let Err(e) = self.storage.delete(crate::auth::AUTH_ENABLED_KEY) {
+            return RaftResponse::Error {
+                message: format!("storage write failed: {e}"),
+            };
+        }
+        // Update the shared auth_enabled flag so the interceptor takes effect immediately
+        self.auth_enabled.store(false, Ordering::Release);
+        RaftResponse::AuthDisable {}
+    }
+
     /// Apply a normal entry's data (after request_id prefix) for raft-rs.
     /// Returns serialized RaftResponse, or an error string on deserialization failure.
     pub fn apply_normal_entry(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -526,7 +1026,16 @@ mod tests {
         let (lease_manager, _expiry_rx) = LeaseManager::new(10000, 1);
         let lease_manager = Arc::new(Mutex::new(lease_manager));
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
-        let sm = AetherStateMachine::new(tx.clone(), storage.clone(), lease_manager, lease_store);
+        let auth_cache = Arc::new(AuthCache::new());
+        let auth_enabled = Arc::new(AtomicBool::new(false));
+        let sm = AetherStateMachine::new(
+            tx.clone(),
+            storage.clone(),
+            lease_manager,
+            lease_store,
+            auth_cache,
+            auth_enabled,
+        );
         (dir, storage, sm)
     }
 
@@ -676,7 +1185,16 @@ mod tests {
         let (lease_manager, _expiry_rx) = LeaseManager::new(10000, 1);
         let lease_manager = Arc::new(Mutex::new(lease_manager));
         let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let mut sm = AetherStateMachine::new(tx, storage, lease_manager, lease_store);
+        let auth_cache = Arc::new(AuthCache::new());
+        let auth_enabled = Arc::new(AtomicBool::new(false));
+        let mut sm = AetherStateMachine::new(
+            tx,
+            storage,
+            lease_manager,
+            lease_store,
+            auth_cache,
+            auth_enabled,
+        );
 
         sm.apply_request(RaftRequest::Put {
             key: b"k".to_vec(),
@@ -699,7 +1217,16 @@ mod tests {
         let (lease_manager, _expiry_rx) = LeaseManager::new(10000, 1);
         let lease_manager = Arc::new(Mutex::new(lease_manager));
         let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-        let mut sm = AetherStateMachine::new(tx, storage, lease_manager, lease_store);
+        let auth_cache = Arc::new(AuthCache::new());
+        let auth_enabled = Arc::new(AtomicBool::new(false));
+        let mut sm = AetherStateMachine::new(
+            tx,
+            storage,
+            lease_manager,
+            lease_store,
+            auth_cache,
+            auth_enabled,
+        );
 
         sm.apply_request(RaftRequest::Put {
             key: b"k".to_vec(),

@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// PermissionType defines the type of permission.
+enum PermissionType {
+    PERMISSION_TYPE_READ = 0;
+    PERMISSION_TYPE_WRITE = 1;
+    PERMISSION_TYPE_READWRITE = 2;
+}
+
+// Permission defines a key-range permission.
+message Permission {
+    PermissionType perm_type = 1;
+    bytes key = 2;
+    bytes range_end = 3;
+}
+
+// User represents an authenticated user.
+message AuthUser {
+    string name = 1;
+    repeated string roles = 2;
+    bool enabled = 3;
+}
+
+// Role represents an authorization role.
+message AuthRole {
+    string name = 1;
+    repeated Permission permissions = 2;
+}
+
+// AetherAuth provides authentication and authorization.
+service AetherAuth {
+    rpc UserAdd(UserAddRequest) returns (UserAddResponse);
+    rpc UserDelete(UserDeleteRequest) returns (UserDeleteResponse);
+    rpc UserGet(UserGetRequest) returns (UserGetResponse);
+    rpc UserList(UserListRequest) returns (UserListResponse);
+    rpc UserChangePassword(UserChangePasswordRequest) returns (UserChangePasswordResponse);
+    rpc UserGrantRole(UserGrantRoleRequest) returns (UserGrantRoleResponse);
+    rpc UserRevokeRole(UserRevokeRoleRequest) returns (UserRevokeRoleResponse);
+    rpc RoleAdd(RoleAddRequest) returns (RoleAddResponse);
+    rpc RoleDelete(RoleDeleteRequest) returns (RoleDeleteResponse);
+    rpc RoleGet(RoleGetRequest) returns (RoleGetResponse);
+    rpc RoleList(RoleListRequest) returns (RoleListResponse);
+    rpc RoleGrantPermission(RoleGrantPermissionRequest) returns (RoleGrantPermissionResponse);
+    rpc RoleRevokePermission(RoleRevokePermissionRequest) returns (RoleRevokePermissionResponse);
+    rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+    rpc AuthEnable(AuthEnableRequest) returns (AuthEnableResponse);
+    rpc AuthDisable(AuthDisableRequest) returns (AuthDisableResponse);
+    rpc AuthStatus(AuthStatusRequest) returns (AuthStatusResponse);
+}
+
+message UserAddRequest {
+    string name = 1;
+    bytes password = 2;
+}
+message UserAddResponse {
+    ResponseHeader header = 1;
+}
+
+message UserDeleteRequest {
+    string name = 1;
+}
+message UserDeleteResponse {
+    ResponseHeader header = 1;
+}
+
+message UserGetRequest {
+    string name = 1;
+}
+message UserGetResponse {
+    ResponseHeader header = 1;
+    AuthUser user = 2;
+}
+
+message UserListRequest {}
+message UserListResponse {
+    ResponseHeader header = 1;
+    repeated AuthUser users = 2;
+}
+
+message UserChangePasswordRequest {
+    string name = 1;
+    bytes password = 2;
+}
+message UserChangePasswordResponse {
+    ResponseHeader header = 1;
+}
+
+message UserGrantRoleRequest {
+    string user = 1;
+    string role = 2;
+}
+message UserGrantRoleResponse {
+    ResponseHeader header = 1;
+}
+
+message UserRevokeRoleRequest {
+    string user = 1;
+    string role = 2;
+}
+message UserRevokeRoleResponse {
+    ResponseHeader header = 1;
+}
+
+message RoleAddRequest {
+    string name = 1;
+}
+message RoleAddResponse {
+    ResponseHeader header = 1;
+}
+
+message RoleDeleteRequest {
+    string name = 1;
+}
+message RoleDeleteResponse {
+    ResponseHeader header = 1;
+}
+
+message RoleGetRequest {
+    string name = 1;
+}
+message RoleGetResponse {
+    ResponseHeader header = 1;
+    AuthRole role = 2;
+}
+
+message RoleListRequest {}
+message RoleListResponse {
+    ResponseHeader header = 1;
+    repeated AuthRole roles = 2;
+}
+
+message RoleGrantPermissionRequest {
+    string role = 1;
+    Permission permission = 2;
+}
+message RoleGrantPermissionResponse {
+    ResponseHeader header = 1;
+}
+
+message RoleRevokePermissionRequest {
+    string role = 1;
+    Permission permission = 2;
+}
+message RoleRevokePermissionResponse {
+    ResponseHeader header = 1;
+}
+
+message AuthenticateRequest {
+    string name = 1;
+    bytes password = 2;
+}
+message AuthenticateResponse {
+    ResponseHeader header = 1;
+    string token = 2;
+}
+
+message AuthEnableRequest {
+    bytes root_password = 1;
+}
+message AuthEnableResponse {
+    ResponseHeader header = 1;
+}
+
+message AuthDisableRequest {}
+message AuthDisableResponse {
+    ResponseHeader header = 1;
+}
+
+message AuthStatusRequest {}
+message AuthStatusResponse {
+    ResponseHeader header = 1;
+    bool enabled = 2;
+}

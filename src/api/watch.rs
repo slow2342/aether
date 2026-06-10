@@ -1,11 +1,13 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth::AuthInterceptor;
 use crate::proto::aether_watch_server::AetherWatch;
 use crate::proto::{
     WatchCancelRequest, WatchCreateRequest, WatchRequest, WatchResponse, watch_request,
@@ -14,11 +16,25 @@ use crate::watch::WatchManager;
 
 pub struct WatchService {
     manager: Arc<WatchManager>,
+    auth_enabled: Arc<AtomicBool>,
+    auth_interceptor: Arc<AuthInterceptor>,
 }
 
 impl WatchService {
-    pub fn new(manager: Arc<WatchManager>) -> Self {
-        Self { manager }
+    pub fn new(
+        manager: Arc<WatchManager>,
+        auth_enabled: Arc<AtomicBool>,
+        auth_interceptor: Arc<AuthInterceptor>,
+    ) -> Self {
+        Self {
+            manager,
+            auth_enabled,
+            auth_interceptor,
+        }
+    }
+
+    fn get_username(req: &Request<impl std::fmt::Debug>) -> Option<String> {
+        req.extensions().get::<String>().cloned()
     }
 }
 
@@ -32,10 +48,16 @@ impl AetherWatch for WatchService {
         &self,
         request: Request<Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let username = Self::get_username(&request);
+        let auth_enabled = self.auth_enabled.clone();
+        let auth_interceptor = self.auth_interceptor.clone();
         let mut inbound = request.into_inner();
         let manager = self.manager.clone();
 
         let (tx, rx) = mpsc::channel::<Result<WatchResponse, Status>>(256);
+
+        // Track whether auth was enabled at stream creation to detect re-enable.
+        let auth_was_enabled = auth_enabled.load(Ordering::Acquire);
 
         tokio::spawn(async move {
             // Track active watch_id -> cancel sender for this stream.
@@ -47,6 +69,40 @@ impl AetherWatch for WatchService {
                     Ok(Some(watch_req)) => {
                         match watch_req.request {
                             Some(watch_request::Request::Create(create)) => {
+                                let auth_now = auth_enabled.load(Ordering::Acquire);
+                                // If auth was disabled at stream start but is now enabled,
+                                // the stream credentials are stale — reject.
+                                if auth_now && !auth_was_enabled && username.is_none() {
+                                    let _ = tx
+                                        .send(Err(Status::unauthenticated(
+                                            "auth re-enabled, please reconnect",
+                                        )))
+                                        .await;
+                                    continue;
+                                }
+                                // Check permission for the watched key range
+                                if auth_now {
+                                    let user = match &username {
+                                        Some(u) => u.as_str(),
+                                        None => {
+                                            let _ = tx
+                                                .send(Err(Status::unauthenticated(
+                                                    "no user in context",
+                                                )))
+                                                .await;
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) = check_watch_perm(
+                                        user,
+                                        &auth_interceptor,
+                                        &create.key,
+                                        &create.range_end,
+                                    ) {
+                                        let _ = tx.send(Err(e)).await;
+                                        continue;
+                                    }
+                                }
                                 handle_create(&manager, &tx, &mut active_watches, create).await;
                             }
                             Some(watch_request::Request::Cancel(cancel)) => {
@@ -77,6 +133,25 @@ impl AetherWatch for WatchService {
 
         let output_stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(output_stream) as WatchStream))
+    }
+}
+
+/// Check if the user has Read permission on the watched key range.
+fn check_watch_perm(
+    username: &str,
+    interceptor: &AuthInterceptor,
+    key: &[u8],
+    range_end: &[u8],
+) -> Result<(), Status> {
+    if range_end.is_empty() {
+        interceptor.check_permission(username, key, crate::auth::PermissionType::Read)
+    } else {
+        interceptor.check_range_permission(
+            username,
+            key,
+            range_end,
+            crate::auth::PermissionType::Read,
+        )
     }
 }
 

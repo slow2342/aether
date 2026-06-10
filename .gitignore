@@ -14,6 +14,9 @@ Thumbs.db
 .env
 .env.*
 
+# Auth signing key (auto-generated, contains secrets)
+.signing_key
+
 # Cargo.lock is committed for reproducible builds (binary application)
 
 # Benchmarks
@@ -25,3 +28,4 @@ spec/
 specs/
 .claude/plans/
 .claude/sessions/
+docs/superpowers/

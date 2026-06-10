@@ -1,12 +1,16 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
+use rand_core::{OsRng, RngCore};
 use tonic::transport::Server;
 
-use aether::api::{ClusterService, KvService, LeaseService, WatchService};
+use aether::api::{AuthService, ClusterService, KvService, LeaseService, WatchService};
+use aether::auth::AuthLayer;
 use aether::config::AetherConfig;
 use aether::lease::{LeaseManager, LeaseStore};
+use aether::proto::aether_auth_server::AetherAuthServer;
 use aether::proto::aether_cluster_server::AetherClusterServer;
 use aether::proto::aether_kv_server::AetherKvServer;
 use aether::proto::aether_lease_server::AetherLeaseServer;
@@ -18,7 +22,7 @@ use aether::raft::raftrs_store::RaftRsStore;
 use aether::raft::rpc::RaftRpcImpl;
 use aether::raft::state_machine::AetherStateMachine;
 use aether::raft::{RaftHandle, WatchEvent};
-use aether::storage::RocksStorage;
+use aether::storage::{RocksStorage, StorageEngine};
 use aether::watch::WatchManager;
 
 #[derive(Parser, Debug)]
@@ -93,12 +97,121 @@ async fn main() -> anyhow::Result<()> {
     let lease_manager = Arc::new(Mutex::new(lease_manager));
     let lease_store_for_sm = lease_store.clone();
     let lease_manager_for_sm = lease_manager.clone();
+    let auth_cache = Arc::new(aether::auth::AuthCache::new());
+    let auth_enabled = Arc::new(AtomicBool::new(config.auth.enabled));
+    let auth_bootstrapped = Arc::new(AtomicBool::new(false));
+
+    // Resolve JWT signing key: use configured value, or load/generate a random key.
+    // All nodes in a cluster MUST share the same signing_key — configure it explicitly.
+    let signing_key = if config.auth.signing_key.is_empty() {
+        let key_path = config.data_dir.join(".signing_key");
+        if key_path.exists() {
+            std::fs::read_to_string(&key_path)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        } else {
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            // Write with restrictive permissions (owner-only read/write)
+            match std::fs::File::create(&key_path) {
+                Ok(f) => {
+                    use std::io::Write;
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                    let mut writer = std::io::BufWriter::new(f);
+                    if let Err(e) = writer.write_all(hex.as_bytes()) {
+                        tracing::error!(error = %e, "failed to write signing key");
+                    } else if let Err(e) = writer.flush() {
+                        tracing::error!(error = %e, "failed to flush signing key");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create signing key file");
+                }
+            }
+            hex
+        }
+    } else {
+        config.auth.signing_key.clone()
+    };
+    if signing_key.is_empty() {
+        anyhow::bail!(
+            "JWT signing key is empty; configure auth.signing_key or ensure data directory is writable"
+        );
+    }
+
+    let token_validator = Arc::new(aether::auth::TokenValidator::new(
+        &signing_key,
+        config.auth.token_expiry_hours,
+    ));
+    let token_validator_for_api = token_validator.clone();
+    let auth_interceptor = Arc::new(aether::auth::AuthInterceptor::new(
+        auth_enabled.clone(),
+        token_validator,
+        auth_cache.clone(),
+        auth_bootstrapped.clone(),
+    ));
+
+    // Load existing auth data from storage into cache (handles node restarts)
+    {
+        let users = storage
+            .scan(aether::auth::USER_KEY_PREFIX, usize::MAX)
+            .unwrap_or_default();
+        let mut loaded_users = Vec::new();
+        for kv in &users {
+            if let Ok(user) =
+                rkyv::from_bytes::<aether::auth::User, rkyv::rancor::BoxedError>(&kv.value)
+            {
+                loaded_users.push(user);
+            }
+        }
+        auth_cache.load_users(loaded_users);
+
+        let roles = storage
+            .scan(aether::auth::ROLE_KEY_PREFIX, usize::MAX)
+            .unwrap_or_default();
+        let mut loaded_roles = Vec::new();
+        for kv in &roles {
+            if let Ok(role) =
+                rkyv::from_bytes::<aether::auth::Role, rkyv::rancor::BoxedError>(&kv.value)
+            {
+                loaded_roles.push(role);
+            }
+        }
+        auth_cache.load_roles(loaded_roles);
+
+        // Restore auth enabled state from previous run
+        if storage
+            .get(aether::auth::AUTH_ENABLED_KEY)
+            .unwrap_or(None)
+            .is_some()
+        {
+            auth_enabled.store(true, Ordering::Release);
+        }
+
+        // Restore bootstrapped flag
+        if storage
+            .get(aether::auth::AUTH_BOOTSTRAPPED_KEY)
+            .unwrap_or(None)
+            .is_some()
+        {
+            auth_bootstrapped.store(true, Ordering::Release);
+        }
+    }
+
+    let auth_cache_for_api = auth_cache.clone();
+    let auth_interceptor_for_api = auth_interceptor.clone();
+
     let state_machine = Arc::new(Mutex::new(AetherStateMachine::new(
         watch_tx.clone(),
         storage.clone(),
         lease_manager_for_sm,
         lease_store_for_sm,
+        auth_cache,
+        auth_enabled.clone(),
     )));
+    // auth_enabled is cloned above; keep a reference for ClusterService below
 
     // Build raft-rs config
     let raft_config = raft::Config {
@@ -152,7 +265,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Create services
     let watch_manager = WatchManager::new(watch_tx);
-    let watch_service = WatchService::new(watch_manager);
+    let watch_service = WatchService::new(
+        watch_manager,
+        auth_enabled.clone(),
+        auth_interceptor_for_api.clone(),
+    );
 
     // Create raft handle for API layer
     let raft_handle: Arc<dyn RaftHandle> = Arc::new(RaftRsHandle::new(
@@ -162,13 +279,32 @@ async fn main() -> anyhow::Result<()> {
         initial_peers.clone(),
     ));
 
-    let kv_service = KvService::new(storage, raft_handle.clone(), config.node_id);
-    let cluster_service = ClusterService::new(raft_handle.clone(), config.node_id);
+    let auth_enabled_for_api = auth_enabled.clone();
+    let kv_service = KvService::new(
+        storage,
+        raft_handle.clone(),
+        config.node_id,
+        auth_enabled.clone(),
+        auth_interceptor,
+    );
+    let cluster_service =
+        ClusterService::new(raft_handle.clone(), config.node_id, auth_enabled.clone());
     let lease_service = LeaseService::new(
         raft_handle.clone(),
         config.node_id,
         lease_manager.clone(),
         config.lease.max_ttl,
+        auth_enabled,
+    );
+
+    let auth_service = AuthService::new(
+        raft_handle.clone(),
+        config.node_id,
+        auth_cache_for_api,
+        token_validator_for_api,
+        auth_enabled_for_api,
+        auth_interceptor_for_api.clone(),
+        auth_bootstrapped,
     );
 
     // Create RPC server (receives messages from other nodes)
@@ -241,7 +377,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Lease expiry task started");
 
+    let auth_layer = AuthLayer::new(auth_interceptor_for_api);
+
     Server::builder()
+        .layer(auth_layer)
+        .add_service(AetherAuthServer::new(auth_service))
         .add_service(AetherKvServer::new(kv_service))
         .add_service(AetherWatchServer::new(watch_service))
         .add_service(AetherLeaseServer::new(lease_service))

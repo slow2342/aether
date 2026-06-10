@@ -6,7 +6,7 @@ pub mod raftrs_store;
 pub mod rpc;
 pub mod state_machine;
 
-pub use self::handle::{RaftError, RaftHandle, require_leader};
+pub use self::handle::{RaftError, RaftHandle, ensure_linearizable, require_leader};
 
 /// Node identifier type
 pub type NodeId = u64;
@@ -64,6 +64,40 @@ pub enum RaftRequest {
     LeaseRevoke { id: i64 },
     /// Keep-alive a lease (reset expiry)
     LeaseKeepAlive { id: i64, expiry_time: i64 },
+    /// Add a user (password already hashed)
+    AuthUserAdd {
+        name: Vec<u8>,
+        password_hash: Vec<u8>,
+    },
+    /// Delete a user
+    AuthUserDelete { name: Vec<u8> },
+    /// Change user password (password already hashed)
+    AuthUserChangePassword {
+        name: Vec<u8>,
+        password_hash: Vec<u8>,
+    },
+    /// Grant a role to a user
+    AuthUserGrantRole { user: Vec<u8>, role: Vec<u8> },
+    /// Revoke a role from a user
+    AuthUserRevokeRole { user: Vec<u8>, role: Vec<u8> },
+    /// Add a role
+    AuthRoleAdd { name: Vec<u8> },
+    /// Delete a role
+    AuthRoleDelete { name: Vec<u8> },
+    /// Grant permission to a role
+    AuthRoleGrantPermission {
+        role: Vec<u8>,
+        permission: crate::auth::Permission,
+    },
+    /// Revoke permission from a role
+    AuthRoleRevokePermission {
+        role: Vec<u8>,
+        permission: crate::auth::Permission,
+    },
+    /// Enable auth (root_password_hash already hashed)
+    AuthEnable { root_password_hash: Vec<u8> },
+    /// Disable auth
+    AuthDisable {},
 }
 
 /// Raft response types
@@ -100,6 +134,17 @@ pub enum RaftResponse {
     LeaseKeepAlive {
         ttl: i64,
     },
+    AuthUserAdd {},
+    AuthUserDelete {},
+    AuthUserChangePassword {},
+    AuthUserGrantRole {},
+    AuthUserRevokeRole {},
+    AuthRoleAdd {},
+    AuthRoleDelete {},
+    AuthRoleGrantPermission {},
+    AuthRoleRevokePermission {},
+    AuthEnable {},
+    AuthDisable {},
     /// Storage error during apply
     Error {
         message: String,
