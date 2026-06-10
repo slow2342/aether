@@ -33,7 +33,7 @@ build:
     - run: cargo build --all-targets
 ```
 
-Build is Linux-only (x86_64 + aarch64). macOS is not tested — production runs on Linux.
+Build is Linux x86_64 only. macOS is not tested — production runs on Linux.
 
 ### 2. Test
 
@@ -99,7 +99,6 @@ proto:
 | Check | Must Pass | Block Merge |
 |-------|-----------|-------------|
 | build (stable, linux) | Yes | Yes |
-| build (aarch64) | Yes | Yes |
 | test | Yes | Yes |
 | clippy | Yes (0 warnings) | Yes |
 | fmt | Yes | Yes |
