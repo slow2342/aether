@@ -50,6 +50,9 @@ pub struct AuthConfig {
 
     #[serde(default = "default_token_expiry")]
     pub token_expiry_hours: u64,
+
+    #[serde(default = "default_signing_key")]
+    pub signing_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +88,12 @@ fn default_token_expiry() -> u64 {
     24
 }
 
+fn default_signing_key() -> String {
+    // Insecure default for development only. All nodes in a cluster must share
+    // the same signing key — configure it explicitly for production.
+    String::new()
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -104,6 +113,7 @@ impl Default for AuthConfig {
         Self {
             enabled: false,
             token_expiry_hours: default_token_expiry(),
+            signing_key: default_signing_key(),
         }
     }
 }

@@ -31,6 +31,14 @@ pub trait RaftHandle: Send + Sync + 'static {
         self.leader_id() == Some(node_id)
     }
 
+    /// Confirm leadership and return the current commit index.
+    /// The caller should wait until the state machine has applied up to this
+    /// index before reading, to guarantee linearizable reads.
+    fn commit_index(&self) -> u64;
+
+    /// Return the last applied index of the state machine.
+    fn applied_index(&self) -> u64;
+
     /// All cluster members: (node_id, addr).
     fn members(&self) -> Vec<(u64, String)>;
 
@@ -69,6 +77,13 @@ pub fn require_leader(raft: &dyn RaftHandle, node_id: NodeId) -> Result<(), Stat
     }
 }
 
+/// Confirm leadership and return the commit index for a linearizable read.
+/// The caller must wait until `raft.applied_index() >= commit_index` before reading.
+pub fn ensure_linearizable(raft: &dyn RaftHandle, node_id: NodeId) -> Result<u64, Status> {
+    require_leader(raft, node_id)?;
+    Ok(raft.commit_index())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +100,12 @@ mod tests {
         }
         fn leader_id(&self) -> Option<u64> {
             self.leader
+        }
+        fn commit_index(&self) -> u64 {
+            0
+        }
+        fn applied_index(&self) -> u64 {
+            0
         }
         fn members(&self) -> Vec<(u64, String)> {
             self.members.clone()

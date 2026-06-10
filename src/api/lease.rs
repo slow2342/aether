@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,6 +18,7 @@ pub struct LeaseService {
     node_id: u64,
     lease_manager: Arc<Mutex<LeaseManager>>,
     max_ttl: i64,
+    auth_enabled: Arc<AtomicBool>,
 }
 
 impl LeaseService {
@@ -25,13 +27,34 @@ impl LeaseService {
         node_id: u64,
         lease_manager: Arc<Mutex<LeaseManager>>,
         max_ttl: i64,
+        auth_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             raft,
             node_id,
             lease_manager,
             max_ttl,
+            auth_enabled,
         }
+    }
+
+    /// Require root user for admin operations when auth is enabled
+    fn require_root(
+        req: &Request<impl std::fmt::Debug>,
+        auth_enabled: &AtomicBool,
+    ) -> Result<(), Status> {
+        if !auth_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let username = req
+            .extensions()
+            .get::<String>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("no user in context"))?;
+        if username != "root" {
+            return Err(Status::permission_denied("root user required"));
+        }
+        Ok(())
     }
 
     fn header(&self) -> ResponseHeader {
@@ -58,6 +81,7 @@ impl AetherLease for LeaseService {
         &self,
         request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         let req = request.into_inner();
         if req.ttl <= 0 {
             return Err(Status::invalid_argument("TTL must be positive"));
@@ -96,6 +120,7 @@ impl AetherLease for LeaseService {
         &self,
         request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         let req = request.into_inner();
         if req.id <= 0 {
             return Err(Status::invalid_argument("lease ID must be positive"));
@@ -120,6 +145,7 @@ impl AetherLease for LeaseService {
         &self,
         request: Request<Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         require_leader(self.raft.as_ref(), self.node_id)?;
 
         let raft = self.raft.clone();
@@ -217,6 +243,7 @@ impl AetherLease for LeaseService {
         &self,
         request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         require_leader(self.raft.as_ref(), self.node_id)?;
         let req = request.into_inner();
         if req.id <= 0 {
@@ -257,8 +284,9 @@ impl AetherLease for LeaseService {
 
     async fn lease_leases(
         &self,
-        _request: Request<LeaseLeasesRequest>,
+        request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         let mgr = self
             .lease_manager
             .lock()

@@ -71,6 +71,18 @@ impl RaftHandle for RaftRsHandle {
         if id == 0 { None } else { Some(id) }
     }
 
+    fn commit_index(&self) -> u64 {
+        self.shared_state
+            .commit_index
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn applied_index(&self) -> u64 {
+        self.shared_state
+            .applied_index
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn members(&self) -> Vec<(u64, String)> {
         self.members.read().unwrap().clone()
     }

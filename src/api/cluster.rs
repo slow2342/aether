@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tonic::{Request, Response, Status};
 
@@ -10,11 +11,35 @@ use crate::raft::{NodeId, RaftHandle, require_leader};
 pub struct ClusterService {
     raft: Arc<dyn RaftHandle>,
     node_id: NodeId,
+    auth_enabled: Arc<AtomicBool>,
 }
 
 impl ClusterService {
-    pub fn new(raft: Arc<dyn RaftHandle>, node_id: NodeId) -> Self {
-        Self { raft, node_id }
+    pub fn new(raft: Arc<dyn RaftHandle>, node_id: NodeId, auth_enabled: Arc<AtomicBool>) -> Self {
+        Self {
+            raft,
+            node_id,
+            auth_enabled,
+        }
+    }
+
+    /// Require root user for admin operations when auth is enabled
+    fn require_root(
+        req: &Request<impl std::fmt::Debug>,
+        auth_enabled: &AtomicBool,
+    ) -> Result<(), Status> {
+        if !auth_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let username = req
+            .extensions()
+            .get::<String>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("no user in context"))?;
+        if username != "root" {
+            return Err(Status::permission_denied("root user required"));
+        }
+        Ok(())
     }
 
     fn header(&self) -> ResponseHeader {
@@ -44,8 +69,9 @@ impl ClusterService {
 impl AetherCluster for ClusterService {
     async fn member_list(
         &self,
-        _request: Request<pb::MemberListRequest>,
+        request: Request<pb::MemberListRequest>,
     ) -> Result<Response<pb::MemberListResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         let members = self.list_members();
         Ok(Response::new(pb::MemberListResponse {
             header: Some(self.header()),
@@ -57,6 +83,7 @@ impl AetherCluster for ClusterService {
         &self,
         request: Request<pb::MemberAddRequest>,
     ) -> Result<Response<pb::MemberAddResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         require_leader(self.raft.as_ref(), self.node_id)?;
 
         let req = request.into_inner();
@@ -109,6 +136,7 @@ impl AetherCluster for ClusterService {
         &self,
         request: Request<pb::MemberRemoveRequest>,
     ) -> Result<Response<pb::MemberRemoveResponse>, Status> {
+        Self::require_root(&request, &self.auth_enabled)?;
         require_leader(self.raft.as_ref(), self.node_id)?;
 
         let req = request.into_inner();
