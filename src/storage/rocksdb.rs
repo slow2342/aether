@@ -7,7 +7,15 @@ use super::{KvPair, StorageEngine, WriteOp};
 use crate::error::StorageError;
 
 /// Column families used by the storage engine
-const COLUMN_FAMILIES: &[&str] = &["default", "raft_log", "raft_state"];
+const COLUMN_FAMILIES: &[&str] = &[
+    "default",
+    "raft_log",
+    "raft_state",
+    "meta",
+    "lease",
+    "lease_keys",
+    "key_lease",
+];
 
 /// RocksDB storage engine implementation
 pub struct RocksStorage {
@@ -37,6 +45,26 @@ impl RocksStorage {
     /// Get a reference to the underlying RocksDB instance
     pub fn db(&self) -> &Arc<DB> {
         &self.db
+    }
+
+    pub fn lease_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle("lease").expect("lease CF not found")
+    }
+
+    pub fn lease_keys_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle("lease_keys")
+            .expect("lease_keys CF not found")
+    }
+
+    pub fn key_lease_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle("key_lease")
+            .expect("key_lease CF not found")
+    }
+
+    pub fn default_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle("default").expect("default CF not found")
     }
 
     /// Clear all user data from the default column family.

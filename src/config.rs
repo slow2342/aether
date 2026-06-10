@@ -20,6 +20,9 @@ pub struct AetherConfig {
 
     #[serde(default)]
     pub log: LogConfig,
+
+    #[serde(default)]
+    pub lease: LeaseConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +117,32 @@ impl Default for LogConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeaseConfig {
+    #[serde(default = "default_max_ttl")]
+    pub max_ttl: i64,
+
+    #[serde(default = "default_max_leases")]
+    pub max_leases: usize,
+}
+
+fn default_max_ttl() -> i64 {
+    86400
+}
+
+fn default_max_leases() -> usize {
+    10000
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            max_ttl: default_max_ttl(),
+            max_leases: default_max_leases(),
+        }
+    }
+}
+
 impl Default for AetherConfig {
     fn default() -> Self {
         Self {
@@ -123,6 +152,7 @@ impl Default for AetherConfig {
             cluster: ClusterConfig::default(),
             auth: AuthConfig::default(),
             log: LogConfig::default(),
+            lease: LeaseConfig::default(),
         }
     }
 }

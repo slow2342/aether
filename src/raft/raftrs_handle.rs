@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use raft::eraftpb::{ConfChange, ConfChangeType};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use std::sync::RwLock;
+use tokio::sync::{mpsc, oneshot};
 
 use super::handle::{RaftError, RaftHandle};
 use super::node::{ConfChangeRequest, ProposeRequest, RaftSharedState};
@@ -15,6 +16,9 @@ pub struct RaftRsHandle {
     propose_tx: mpsc::Sender<ProposeRequest>,
     conf_change_tx: mpsc::Sender<ConfChangeRequest>,
     shared_state: Arc<RaftSharedState>,
+    // Uses std::sync::RwLock (not tokio::sync::RwLock) because members() is a
+    // sync method on the trait, and write operations (add_learner, change_membership)
+    // only hold the lock during synchronous mutations — no .await while guarded.
     members: RwLock<Vec<(u64, String)>>,
 }
 
@@ -68,8 +72,7 @@ impl RaftHandle for RaftRsHandle {
     }
 
     fn members(&self) -> Vec<(u64, String)> {
-        // Acquire read lock and clone. The overhead is negligible for cluster-sized lists.
-        self.members.blocking_read().clone()
+        self.members.read().unwrap().clone()
     }
 
     async fn add_learner(&self, id: u64, addr: String) -> Result<(), RaftError> {
@@ -86,7 +89,7 @@ impl RaftHandle for RaftRsHandle {
         rx.await.map_err(|_| RaftError::ChannelClosed)??;
 
         // Update local member list so require_leader can find the new node's address.
-        self.members.write().await.push((id, addr));
+        self.members.write().unwrap().push((id, addr));
         Ok(())
     }
 
@@ -94,7 +97,7 @@ impl RaftHandle for RaftRsHandle {
         let old_voters: Vec<u64> = self
             .members
             .read()
-            .await
+            .unwrap()
             .iter()
             .map(|(id, _)| *id)
             .collect();
@@ -138,7 +141,7 @@ impl RaftHandle for RaftRsHandle {
         }
 
         // Update local member list: add new voters, remove old ones.
-        let mut members = self.members.write().await;
+        let mut members = self.members.write().unwrap();
         for node_id in to_add {
             if !members.iter().any(|(id, _)| *id == node_id) {
                 members.push((node_id, String::new()));

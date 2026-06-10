@@ -58,6 +58,12 @@ pub enum RaftRequest {
     MemberAdd { member: RaftNode },
     /// Remove a member from the cluster
     MemberRemove { node_id: NodeId },
+    /// Grant a new lease (ID auto-assigned by state machine)
+    LeaseGrant { ttl: i64, expiry_time: i64 },
+    /// Revoke a lease and delete all attached keys
+    LeaseRevoke { id: i64 },
+    /// Keep-alive a lease (reset expiry)
+    LeaseKeepAlive { id: i64, expiry_time: i64 },
 }
 
 /// Raft response types
@@ -86,6 +92,14 @@ pub enum RaftResponse {
         member: RaftNode,
     },
     MemberRemove {},
+    LeaseGrant {
+        id: i64,
+        ttl: i64,
+    },
+    LeaseRevoke {},
+    LeaseKeepAlive {
+        ttl: i64,
+    },
     /// Storage error during apply
     Error {
         message: String,
@@ -417,21 +431,4 @@ pub struct WatchEvent {
 pub enum WatchEventType {
     Put,
     Delete,
-}
-
-/// Lease information
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-pub struct LeaseInfo {
-    pub id: i64,
-    pub ttl: i64,
-    pub granted_ttl: i64,
-    pub keys: Vec<Vec<u8>>,
 }

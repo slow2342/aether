@@ -1,0 +1,278 @@
+use std::sync::{Arc, Mutex};
+
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
+
+use crate::lease::{LeaseManager, now_millis};
+use crate::proto::aether_lease_server::AetherLease;
+use crate::proto::{
+    LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
+    LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse, LeaseStatus,
+    LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, ResponseHeader,
+};
+use crate::raft::{self, RaftHandle, require_leader};
+
+pub struct LeaseService {
+    raft: Arc<dyn RaftHandle>,
+    node_id: u64,
+    lease_manager: Arc<Mutex<LeaseManager>>,
+    max_ttl: i64,
+}
+
+impl LeaseService {
+    pub fn new(
+        raft: Arc<dyn RaftHandle>,
+        node_id: u64,
+        lease_manager: Arc<Mutex<LeaseManager>>,
+        max_ttl: i64,
+    ) -> Self {
+        Self {
+            raft,
+            node_id,
+            lease_manager,
+            max_ttl,
+        }
+    }
+
+    fn header(&self) -> ResponseHeader {
+        ResponseHeader {
+            cluster_id: 0,
+            member_id: self.node_id,
+            revision: 0,
+            raft_term: 0,
+        }
+    }
+
+    async fn propose(&self, request: raft::RaftRequest) -> Result<raft::RaftResponse, Status> {
+        require_leader(self.raft.as_ref(), self.node_id)?;
+        self.raft
+            .propose(request)
+            .await
+            .map_err(|e| Status::internal(format!("raft write failed: {e}")))
+    }
+}
+
+#[tonic::async_trait]
+impl AetherLease for LeaseService {
+    async fn lease_grant(
+        &self,
+        request: Request<LeaseGrantRequest>,
+    ) -> Result<Response<LeaseGrantResponse>, Status> {
+        let req = request.into_inner();
+        if req.ttl <= 0 {
+            return Err(Status::invalid_argument("TTL must be positive"));
+        }
+
+        let ttl = if req.ttl > self.max_ttl {
+            tracing::warn!(
+                requested = req.ttl,
+                max = self.max_ttl,
+                "TTL clamped to max_ttl"
+            );
+            self.max_ttl
+        } else {
+            req.ttl
+        };
+
+        // Compute expiry_time on the leader so the state machine apply path
+        // is deterministic across all nodes.
+        let expiry_time = now_millis() + ttl * 1000;
+        let resp = self
+            .propose(raft::RaftRequest::LeaseGrant { ttl, expiry_time })
+            .await?;
+
+        match resp {
+            raft::RaftResponse::LeaseGrant { id, ttl } => Ok(Response::new(LeaseGrantResponse {
+                header: Some(self.header()),
+                id,
+                ttl,
+            })),
+            raft::RaftResponse::Error { message } => Err(Status::internal(message)),
+            _ => Err(Status::internal("unexpected response type")),
+        }
+    }
+
+    async fn lease_revoke(
+        &self,
+        request: Request<LeaseRevokeRequest>,
+    ) -> Result<Response<LeaseRevokeResponse>, Status> {
+        let req = request.into_inner();
+        if req.id <= 0 {
+            return Err(Status::invalid_argument("lease ID must be positive"));
+        }
+
+        let resp = self
+            .propose(raft::RaftRequest::LeaseRevoke { id: req.id })
+            .await?;
+
+        match resp {
+            raft::RaftResponse::LeaseRevoke {} => Ok(Response::new(LeaseRevokeResponse {
+                header: Some(self.header()),
+            })),
+            raft::RaftResponse::Error { message } => Err(Status::internal(message)),
+            _ => Err(Status::internal("unexpected response type")),
+        }
+    }
+
+    type LeaseKeepAliveStream = ReceiverStream<Result<LeaseKeepAliveResponse, Status>>;
+
+    async fn lease_keep_alive(
+        &self,
+        request: Request<Streaming<LeaseKeepAliveRequest>>,
+    ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
+        require_leader(self.raft.as_ref(), self.node_id)?;
+
+        let raft = self.raft.clone();
+        let header = self.header();
+        let lease_manager = self.lease_manager.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let mut stream = request.into_inner();
+
+        tokio::spawn(async move {
+            while let Ok(Some(req)) = stream.message().await {
+                if req.id <= 0 {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument("lease ID must be positive")))
+                        .await;
+                    continue;
+                }
+
+                // Look up granted_ttl and compute expiry_time on the leader
+                // so the state machine apply path is deterministic.
+                // Drop the guard before any .await to satisfy Send bounds.
+                let granted_ttl = lease_manager
+                    .lock()
+                    .ok()
+                    .and_then(|mgr| mgr.get(req.id).map(|l| l.granted_ttl));
+                let expiry_time = match granted_ttl {
+                    Some(ttl) if ttl > 0 => now_millis() + ttl * 1000,
+                    _ => {
+                        let _ = tx
+                            .send(Err(Status::not_found(format!(
+                                "lease not found: {}",
+                                req.id
+                            ))))
+                            .await;
+                        continue;
+                    }
+                };
+
+                let resp = raft
+                    .propose(raft::RaftRequest::LeaseKeepAlive {
+                        id: req.id,
+                        expiry_time,
+                    })
+                    .await;
+
+                match resp {
+                    Ok(raft::RaftResponse::LeaseKeepAlive { ttl }) => {
+                        let _ = tx
+                            .send(Ok(LeaseKeepAliveResponse {
+                                header: Some(header),
+                                id: req.id,
+                                ttl,
+                            }))
+                            .await;
+                    }
+                    Ok(raft::RaftResponse::Error { message }) => {
+                        let _ = tx.send(Err(Status::internal(message))).await;
+                    }
+                    Err(e) => {
+                        let status = match &e {
+                            crate::raft::RaftError::NotLeader { .. } => {
+                                let mut s = Status::unavailable("not leader");
+                                if let Some(addr) = raft
+                                    .members()
+                                    .into_iter()
+                                    .find(|(id, _)| Some(*id) == raft.leader_id())
+                                    .map(|(_, addr)| addr)
+                                {
+                                    let mut metadata = tonic::metadata::MetadataMap::new();
+                                    if let Ok(val) = addr.parse() {
+                                        metadata.insert("x-aether-leader", val);
+                                        s = Status::with_metadata(s.code(), s.message(), metadata);
+                                    }
+                                }
+                                s
+                            }
+                            crate::raft::RaftError::NoLeader => {
+                                Status::unavailable("no leader elected")
+                            }
+                            _ => Status::internal(format!("raft error: {e}")),
+                        };
+                        let _ = tx.send(Err(status)).await;
+                    }
+                    _ => {
+                        let _ = tx.send(Err(Status::internal("unexpected response"))).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn lease_time_to_live(
+        &self,
+        request: Request<LeaseTimeToLiveRequest>,
+    ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
+        require_leader(self.raft.as_ref(), self.node_id)?;
+        let req = request.into_inner();
+        if req.id <= 0 {
+            return Err(Status::invalid_argument("lease ID must be positive"));
+        }
+
+        let (id, ttl, granted_ttl, keys) = {
+            let mgr = self
+                .lease_manager
+                .lock()
+                .map_err(|e| Status::internal(format!("lease manager lock poisoned: {e}")))?;
+
+            match mgr.get(req.id) {
+                Some(lease) => {
+                    let remaining = (lease.expiry_time - now_millis()) / 1000;
+                    let ttl = remaining.max(0);
+                    let keys = if req.keys {
+                        mgr.get_keys(req.id)
+                            .map(|s| s.iter().cloned().collect())
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    (lease.id, ttl, lease.granted_ttl, keys)
+                }
+                None => return Err(Status::not_found(format!("lease not found: {}", req.id))),
+            }
+        };
+
+        Ok(Response::new(LeaseTimeToLiveResponse {
+            header: Some(self.header()),
+            id,
+            ttl,
+            granted_ttl,
+            keys,
+        }))
+    }
+
+    async fn lease_leases(
+        &self,
+        _request: Request<LeaseLeasesRequest>,
+    ) -> Result<Response<LeaseLeasesResponse>, Status> {
+        let mgr = self
+            .lease_manager
+            .lock()
+            .map_err(|e| Status::internal(format!("lease manager lock poisoned: {e}")))?;
+
+        let leases = mgr
+            .list()
+            .into_iter()
+            .map(|id| LeaseStatus { id })
+            .collect();
+
+        Ok(Response::new(LeaseLeasesResponse {
+            header: Some(self.header()),
+            leases,
+        }))
+    }
+}
