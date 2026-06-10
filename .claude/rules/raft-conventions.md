@@ -1,18 +1,22 @@
 # Raft Integration Conventions
 
-## OpenRaft Type Configuration
+## raft-rs Type Configuration
 
-Define a single `TypeConfig` type alias used everywhere:
+Uses raft-rs 0.7 (TiKV fork) with a dedicated event loop thread:
 
 ```rust
-use openraft::alias::*;
-
 pub type NodeId = u64;
 
-openraft::declare_raft_types!(
-    pub TypeConfig: D = RaftRequest, R = RaftResponse, NodeId = NodeId, Node = RaftNode, Entry = Entry<TypeConfig>, SnapshotData = Cursor<Vec<u8>>
-);
+// Event loop runs on a dedicated std::thread, communicates via channels.
+// RaftHandle trait abstracts over the raft implementation for the API layer.
 ```
+
+## Event Loop Architecture
+
+- Raft event loop runs on a dedicated `std::thread` (not tokio)
+- Uses `crossbeam-channel` for blocking multi-channel recv with timeout
+- Tokio ↔ crossbeam bridge tasks forward messages between async and sync worlds
+- `RaftSharedState` (AtomicU64) exposes leader_id to the async API layer
 
 ## State Machine Rules
 
@@ -70,8 +74,8 @@ pub struct AetherStateMachine {
 
 ### Column Families
 
-- `raft_log`: log entries indexed by `[term][index]`
-- `raft_state`: HardState, ConfState, last_log_index
+- `raft_log`: log entries indexed by `[index: u64 BE]` → protobuf Entry
+- `raft_state`: HardState, ConfState, last_purged, snapshot_index, snapshot_term
 
 ### Snapshot
 

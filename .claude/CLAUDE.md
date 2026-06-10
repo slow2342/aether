@@ -10,12 +10,15 @@ src/
 ├── lib.rs           # Module declarations
 ├── config.rs        # Configuration structs
 ├── error.rs         # Unified error types
-├── raft/            # Raft consensus (openraft)
-│   ├── mod.rs       # Type definitions (NodeId, RaftTypeConfig)
+├── raft/            # Raft consensus (raft-rs)
+│   ├── mod.rs       # Type definitions (NodeId, RaftRequest, RaftResponse)
+│   ├── handle.rs    # RaftHandle trait abstraction
+│   ├── node.rs      # Raft event loop (dedicated thread)
+│   ├── raftrs_handle.rs  # RaftHandle impl for raft-rs
+│   ├── raftrs_store.rs   # RocksDB-backed raft log store
 │   ├── state_machine.rs  # Apply log → storage engine
-│   ├── log_store.rs      # Raft log persistence (RocksDB CF)
 │   ├── network.rs        # Inter-node RPC (tonic)
-│   └── snapshot.rs       # Snapshot creation/restore
+│   └── rpc.rs            # Raft RPC server
 ├── storage/         # Storage engine layer
 │   ├── mod.rs       # StorageEngine trait
 │   ├── rocksdb.rs   # RocksDB implementation
@@ -93,7 +96,7 @@ Client → gRPC API → Raft Leader → Log Entry → State Machine → RocksDB
 
 ### Key Dependencies
 
-- **openraft**: Raft consensus protocol
+- **raft**: Raft consensus protocol (crates.io `raft` crate v0.7)
 - **rocksdb**: Embedded KV storage engine
 - **rkyv**: Zero-copy serialization for internal data
 - **tonic/prost**: gRPC framework
@@ -113,7 +116,7 @@ All coding conventions are in `rules/`. Read the relevant file before making cha
 | Logging, metrics, health checks | [logging-conventions.md](rules/logging-conventions.md) |
 | Protobuf definitions | [proto-conventions.md](rules/proto-conventions.md) |
 | RocksDB storage layer | [storage-conventions.md](rules/storage-conventions.md) |
-| Raft integration (openraft) | [raft-conventions.md](rules/raft-conventions.md) |
+| Raft integration (raft-rs) | [raft-conventions.md](rules/raft-conventions.md) |
 | gRPC API design | [api-design.md](rules/api-design.md) |
 | Testing & benchmarks | [testing-conventions.md](rules/testing-conventions.md) |
 | Security & auth | [security-conventions.md](rules/security-conventions.md) |

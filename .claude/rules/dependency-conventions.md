@@ -18,7 +18,7 @@ Before adding a new crate, answer these questions:
 serde = "1.0"
 
 # Minor version pinned for unstable crates
-openraft = "0.9"
+raft = "0.7"
 
 # Exact pin only for known-buggy versions
 # BAD: some-crate = "=1.2.3"  (unless documenting a known issue)
@@ -36,7 +36,7 @@ openraft = "0.9"
 ```toml
 # Enable only needed features
 tokio = { version = "1", features = ["full"] }  # OK for tokio — we use everything
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }  # OK — specific features
+raft = { version = "0.7", default-features = false, features = ["prost-codec", "default-logger"] }  # OK — specific features
 
 # BAD: enabling default features when only one is needed
 some-crate = "1.0"  # pulls in 20 features, we only need 2
@@ -52,7 +52,7 @@ Organize `Cargo.toml` dependencies by category with comments:
 ```toml
 [dependencies]
 # --- Raft consensus ---
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+raft = { version = "0.7", default-features = false, features = ["prost-codec", "default-logger"] }
 
 # --- Storage ---
 rocksdb = "0.24.0"

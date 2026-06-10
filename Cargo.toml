@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 # --- Raft consensus ---
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 
 # --- Storage ---
 rocksdb = "0.24"
@@ -40,6 +39,12 @@ bytes = "1"
 futures = "0.3"
 serde_json = "1"
 tokio-stream = "0.1.18"
+raft = { git = "https://github.com/tikv/raft-rs", rev = "ad13f3d90780f53aea2488c6a4b76c0d334bf136", default-features = false, features = ["prost-codec", "default-logger"] }
+# raft-rs 0.7 depends on prost 0.11, while tonic 0.14 uses prost 0.14.
+# We alias prost 0.11 as prost011 to avoid version conflicts.
+prost011 = { version = "0.11", package = "prost" }
+# Used in the raft event loop for blocking multi-channel recv with timeout.
+crossbeam-channel = "0.5"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

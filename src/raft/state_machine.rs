@@ -1,67 +1,50 @@
-use std::io::Cursor;
-
-use openraft::storage::RaftStateMachine;
-use openraft::{
-    EntryPayload, LogId, OptionalSend, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
-    StoredMembership,
-};
-
 use std::sync::Arc;
 
-use super::{RaftNode, RaftRequest, RaftResponse, TypeConfig, WatchEvent};
+use super::{RaftRequest, RaftResponse, WatchEvent};
 use crate::storage::{RocksStorage, StorageEngine};
 
-/// Snapshot data persisted on disk
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SnapshotData {
-    pub last_applied: Option<LogId<u64>>,
-    pub last_membership: StoredMembership<u64, RaftNode>,
-    pub data: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
 /// Aether state machine implementation.
-/// All user data is stored in RocksDB. The BTreeMap was removed in favor of
-/// a single source of truth in the storage engine.
+/// All user data is stored in RocksDB.
 pub struct AetherStateMachine {
     /// Applied log index
-    pub last_applied: Option<LogId<u64>>,
-    /// Last membership config
-    pub last_membership: StoredMembership<u64, RaftNode>,
+    pub last_applied: u64,
     /// RocksDB storage for persistent user data
     pub storage: Arc<RocksStorage>,
     /// Watch event notifier
     pub watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
-    /// Current snapshot data
-    pub current_snapshot: Option<Vec<u8>>,
 }
 
 impl AetherStateMachine {
-    /// Create a new state machine
     pub fn new(
         watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
         storage: Arc<RocksStorage>,
     ) -> Self {
         Self {
-            last_applied: None,
-            last_membership: StoredMembership::default(),
+            last_applied: 0,
             storage,
             watch_tx,
-            current_snapshot: None,
         }
     }
 
-    /// Read a key from storage, returning None on error.
     fn storage_get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.storage.get(key).ok().flatten()
+        match self.storage.get(key) {
+            Ok(val) => val,
+            Err(e) => {
+                tracing::error!(error = %e, key = ?key, "storage get failed");
+                None
+            }
+        }
     }
 
-    /// Read a range from storage, returning empty vec on error.
     fn storage_range(&self, key: &[u8], range_end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let end = if range_end == b"\0" { &[] } else { range_end };
-        self.storage
-            .range_scan(key, end, usize::MAX)
-            .map(|kvs| kvs.into_iter().map(|kv| (kv.key, kv.value)).collect())
-            .unwrap_or_default()
+        match self.storage.range_scan(key, end, usize::MAX) {
+            Ok(kvs) => kvs.into_iter().map(|kv| (kv.key, kv.value)).collect(),
+            Err(e) => {
+                tracing::error!(error = %e, key = ?key, "storage range_scan failed");
+                vec![]
+            }
+        }
     }
 
     /// Apply a request to the state machine
@@ -82,8 +65,9 @@ impl AetherStateMachine {
                 });
                 if let Err(e) = self.storage.put(&key, &value) {
                     tracing::error!(error = %e, "failed to put to storage");
-                    // Don't send watch event on storage failure.
-                    return RaftResponse::Put { prev_kv: None };
+                    return RaftResponse::Error {
+                        message: format!("put failed: {e}"),
+                    };
                 }
 
                 let _ = self.watch_tx.send(WatchEvent {
@@ -110,9 +94,8 @@ impl AetherStateMachine {
                         Some(value) => {
                             if let Err(e) = self.storage.delete(&key) {
                                 tracing::error!(error = %e, "failed to delete from storage");
-                                return RaftResponse::Delete {
-                                    deleted: 0,
-                                    prev_kvs: vec![],
+                                return RaftResponse::Error {
+                                    message: format!("delete failed: {e}"),
                                 };
                             }
                             deleted = 1;
@@ -138,9 +121,8 @@ impl AetherStateMachine {
                         .collect();
                     if let Err(e) = self.storage.batch_write(ops) {
                         tracing::error!(error = %e, "failed to batch delete from storage");
-                        return RaftResponse::Delete {
-                            deleted: 0,
-                            prev_kvs: vec![],
+                        return RaftResponse::Error {
+                            message: format!("batch delete failed: {e}"),
                         };
                     }
                     deleted = pairs.len() as i64;
@@ -161,7 +143,7 @@ impl AetherStateMachine {
                     let _ = self.watch_tx.send(WatchEvent {
                         event_type: super::WatchEventType::Delete,
                         kv: kv.clone(),
-                        prev_kv: Some(kv.clone()),
+                        prev_kv: None,
                     });
                 }
 
@@ -191,8 +173,6 @@ impl AetherStateMachine {
                                     .is_some_and(|v| v < expected.as_slice()),
                             }
                         }
-                        // Version/Create/Mod/Lease comparisons require MVCC metadata,
-                        // which is not yet supported. Fail safe.
                         _ => false,
                     }
                 });
@@ -300,167 +280,226 @@ impl AetherStateMachine {
             RaftRequest::MemberRemove { node_id: _ } => RaftResponse::MemberRemove {},
         }
     }
-}
 
-impl RaftSnapshotBuilder<TypeConfig> for AetherStateMachine {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // Read all user data from RocksDB for the snapshot.
-        let kvs = self.storage.range_scan(&[], &[], usize::MAX).map_err(|e| {
-            tracing::error!(error = %e, "failed to read storage for snapshot");
-            StorageError::IO {
-                source: openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::new(&e),
-                ),
-            }
-        })?;
-        let data: Vec<(Vec<u8>, Vec<u8>)> = kvs.into_iter().map(|kv| (kv.key, kv.value)).collect();
-
-        let snapshot_data = SnapshotData {
-            last_applied: self.last_applied,
-            last_membership: self.last_membership.clone(),
-            data,
-        };
-
-        let data = serde_json::to_vec(&snapshot_data).map_err(|e| StorageError::IO {
-            source: openraft::StorageIOError::new(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::new(&e),
-            ),
-        })?;
-
-        let meta = SnapshotMeta {
-            last_log_id: self.last_applied,
-            last_membership: self.last_membership.clone(),
-            snapshot_id: format!("snapshot-{}", self.last_applied.map_or(0, |id| id.index)),
-        };
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        })
-    }
-}
-
-impl RaftStateMachine<TypeConfig> for AetherStateMachine {
-    type SnapshotBuilder = Self;
-
-    async fn applied_state(
-        &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, RaftNode>), StorageError<u64>> {
-        Ok((self.last_applied, self.last_membership.clone()))
-    }
-
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<u64>>
-    where
-        I: IntoIterator<Item = openraft::Entry<TypeConfig>> + OptionalSend,
-        I::IntoIter: OptionalSend,
-    {
-        let mut responses = Vec::new();
-
-        for entry in entries {
-            self.last_applied = Some(entry.log_id);
-
-            let resp = match entry.payload {
-                EntryPayload::Blank => RaftResponse::Put { prev_kv: None },
-                EntryPayload::Normal(req) => self.apply_request(req),
-                EntryPayload::Membership(mem) => {
-                    self.last_membership = StoredMembership::new(Some(entry.log_id), mem);
-                    RaftResponse::Put { prev_kv: None }
-                }
-            };
-
-            responses.push(resp);
-        }
-
-        Ok(responses)
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        AetherStateMachine {
-            last_applied: self.last_applied,
-            last_membership: self.last_membership.clone(),
-            storage: self.storage.clone(),
-            watch_tx: self.watch_tx.clone(),
-            current_snapshot: None,
-        }
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<u64, RaftNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<u64>> {
-        let snapshot_data: SnapshotData =
-            serde_json::from_slice(snapshot.get_ref()).map_err(|e| StorageError::IO {
-                source: openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::new(&e),
-                ),
+    /// Apply a normal entry's data (after request_id prefix) for raft-rs.
+    /// Returns serialized RaftResponse, or an error string on deserialization failure.
+    pub fn apply_normal_entry(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let request: RaftRequest = rkyv::from_bytes::<RaftRequest, rkyv::rancor::BoxedError>(data)
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to deserialize RaftRequest");
+                format!("deserialize failed: {e}")
             })?;
-
-        self.last_applied = snapshot_data.last_applied;
-        self.last_membership = meta.last_membership.clone();
-        self.current_snapshot = Some(snapshot.into_inner());
-
-        // Clear existing user data in RocksDB before writing snapshot.
-        // This removes stale keys that are not in the snapshot.
-        self.storage.clear_default_cf().map_err(|e| {
-            tracing::error!(error = %e, "failed to clear storage before snapshot restore");
-            StorageError::IO {
-                source: openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::new(&e),
-                ),
-            }
-        })?;
-
-        // Write snapshot data to RocksDB.
-        let ops: Vec<_> = snapshot_data
-            .data
-            .into_iter()
-            .map(|(k, v)| crate::storage::WriteOp::Put { key: k, value: v })
-            .collect();
-        self.storage.batch_write(ops).map_err(|e| {
-            tracing::error!(error = %e, "failed to sync snapshot to storage");
-            StorageError::IO {
-                source: openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::new(&e),
-                ),
-            }
-        })?;
-
-        Ok(())
+        let response = self.apply_request(request);
+        rkyv::to_bytes::<rkyv::rancor::BoxedError>(&response)
+            .map(|b| b.into_vec())
+            .map_err(|e| format!("serialize failed: {e}"))
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        match &self.current_snapshot {
-            Some(data) => {
-                let meta = SnapshotMeta {
-                    last_log_id: self.last_applied,
-                    last_membership: self.last_membership.clone(),
-                    snapshot_id: format!("snapshot-{}", self.last_applied.map_or(0, |id| id.index)),
-                };
-                Ok(Some(Snapshot {
-                    meta,
-                    snapshot: Box::new(Cursor::new(data.clone())),
-                }))
-            }
-            None => Ok(None),
+    /// Apply a configuration change for raft-rs.
+    pub fn apply_conf_change(&mut self, cc: &raft::eraftpb::ConfChange, index: u64) {
+        self.last_applied = index;
+        tracing::info!(
+            change_type = ?cc.change_type,
+            node_id = cc.node_id,
+            index = index,
+            "applied conf change"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::{self, WatchEventType};
+    use tempfile::tempdir;
+
+    fn setup() -> (tempfile::TempDir, Arc<RocksStorage>, AetherStateMachine) {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(RocksStorage::open(dir.path()).unwrap());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let sm = AetherStateMachine::new(tx.clone(), storage.clone());
+        (dir, storage, sm)
+    }
+
+    #[test]
+    fn test_put_and_get() {
+        let (_dir, storage, mut sm) = setup();
+
+        let req = RaftRequest::Put {
+            key: b"key1".to_vec(),
+            value: b"val1".to_vec(),
+            lease_id: 0,
+        };
+        let resp = sm.apply_request(req);
+        match resp {
+            RaftResponse::Put { prev_kv } => assert!(prev_kv.is_none()),
+            other => panic!("expected Put response, got: {other:?}"),
         }
+
+        let stored = storage.get(b"key1").unwrap();
+        assert_eq!(stored, Some(b"val1".to_vec()));
+    }
+
+    #[test]
+    fn test_put_returns_prev_kv() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(RaftRequest::Put {
+            key: b"k".to_vec(),
+            value: b"v1".to_vec(),
+            lease_id: 0,
+        });
+
+        let resp = sm.apply_request(RaftRequest::Put {
+            key: b"k".to_vec(),
+            value: b"v2".to_vec(),
+            lease_id: 0,
+        });
+        match resp {
+            RaftResponse::Put { prev_kv } => {
+                let kv = prev_kv.expect("should have prev_kv");
+                assert_eq!(kv.key, b"k");
+                assert_eq!(kv.value, b"v1");
+            }
+            other => panic!("expected Put response, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_delete_single_key() {
+        let (_dir, storage, mut sm) = setup();
+
+        sm.apply_request(RaftRequest::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease_id: 0,
+        });
+
+        let resp = sm.apply_request(RaftRequest::Delete {
+            key: b"k".to_vec(),
+            range_end: vec![],
+        });
+        match resp {
+            RaftResponse::Delete { deleted, prev_kvs } => {
+                assert_eq!(deleted, 1);
+                assert_eq!(prev_kvs.len(), 1);
+                assert_eq!(prev_kvs[0].value, b"v");
+            }
+            other => panic!("expected Delete response, got: {other:?}"),
+        }
+
+        assert_eq!(storage.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_missing_key() {
+        let (_dir, _storage, mut sm) = setup();
+
+        let resp = sm.apply_request(RaftRequest::Delete {
+            key: b"missing".to_vec(),
+            range_end: vec![],
+        });
+        match resp {
+            RaftResponse::Delete { deleted, prev_kvs } => {
+                assert_eq!(deleted, 0);
+                assert!(prev_kvs.is_empty());
+            }
+            other => panic!("expected Delete response, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_member_add_passthrough() {
+        let (_dir, _storage, mut sm) = setup();
+
+        let resp = sm.apply_request(RaftRequest::MemberAdd {
+            member: raft::RaftNode {
+                addr: "127.0.0.1:2380".to_string(),
+                data: String::new(),
+            },
+        });
+        match resp {
+            RaftResponse::MemberAdd { member } => {
+                assert_eq!(member.addr, "127.0.0.1:2380");
+            }
+            other => panic!("expected MemberAdd response, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_member_remove_passthrough() {
+        let (_dir, _storage, mut sm) = setup();
+
+        let resp = sm.apply_request(RaftRequest::MemberRemove { node_id: 2 });
+        match resp {
+            RaftResponse::MemberRemove {} => {}
+            other => panic!("expected MemberRemove response, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_normal_entry_roundtrip() {
+        let (_dir, _storage, mut sm) = setup();
+
+        let req = RaftRequest::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease_id: 0,
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&req)
+            .unwrap()
+            .into_vec();
+
+        let resp_bytes = sm.apply_normal_entry(&data).unwrap();
+        let resp: RaftResponse =
+            rkyv::from_bytes::<RaftResponse, rkyv::rancor::BoxedError>(&resp_bytes).unwrap();
+        match resp {
+            RaftResponse::Put { prev_kv } => assert!(prev_kv.is_none()),
+            other => panic!("expected Put, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_watch_event_on_put() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(RocksStorage::open(dir.path()).unwrap());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let mut sm = AetherStateMachine::new(tx, storage);
+
+        sm.apply_request(RaftRequest::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease_id: 42,
+        });
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, WatchEventType::Put);
+        assert_eq!(event.kv.key, b"k");
+        assert_eq!(event.kv.value, b"v");
+        assert_eq!(event.kv.lease, 42);
+    }
+
+    #[test]
+    fn test_watch_event_on_delete() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(RocksStorage::open(dir.path()).unwrap());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let mut sm = AetherStateMachine::new(tx, storage);
+
+        sm.apply_request(RaftRequest::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease_id: 0,
+        });
+        let _ = rx.try_recv(); // consume put event
+
+        sm.apply_request(RaftRequest::Delete {
+            key: b"k".to_vec(),
+            range_end: vec![],
+        });
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, WatchEventType::Delete);
+        assert_eq!(event.kv.key, b"k");
     }
 }
