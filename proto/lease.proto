@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherLease provides lease management operations.
+service AetherLease {
+    // LeaseGrant creates a new lease with a TTL.
+    rpc LeaseGrant(LeaseGrantRequest) returns (LeaseGrantResponse);
+    // LeaseRevoke revokes a lease and deletes all attached keys.
+    rpc LeaseRevoke(LeaseRevokeRequest) returns (LeaseRevokeResponse);
+    // LeaseKeepAlive keeps a lease alive by resetting its TTL.
+    rpc LeaseKeepAlive(stream LeaseKeepAliveRequest) returns (stream LeaseKeepAliveResponse);
+    // LeaseTimeToLive returns the remaining TTL of a lease.
+    rpc LeaseTimeToLive(LeaseTimeToLiveRequest) returns (LeaseTimeToLiveResponse);
+    // LeaseLeases lists all active leases.
+    rpc LeaseLeases(LeaseLeasesRequest) returns (LeaseLeasesResponse);
+}
+
+message LeaseGrantRequest {
+    int64 ttl = 1;
+    reserved 2;  // was: int64 id (removed — IDs are server-assigned)
+}
+
+message LeaseGrantResponse {
+    ResponseHeader header = 1;
+    int64 id = 2;
+    int64 ttl = 3;
+}
+
+message LeaseRevokeRequest {
+    int64 id = 1;
+}
+
+message LeaseRevokeResponse {
+    ResponseHeader header = 1;
+}
+
+message LeaseKeepAliveRequest {
+    int64 id = 1;
+}
+
+message LeaseKeepAliveResponse {
+    ResponseHeader header = 1;
+    int64 id = 2;
+    int64 ttl = 3;
+}
+
+message LeaseTimeToLiveRequest {
+    int64 id = 1;
+    bool keys = 2;
+}
+
+message LeaseTimeToLiveResponse {
+    ResponseHeader header = 1;
+    int64 id = 2;
+    int64 ttl = 3;
+    int64 granted_ttl = 4;
+    repeated bytes keys = 5;
+}
+
+message LeaseLeasesRequest {}
+
+message LeaseLeasesResponse {
+    ResponseHeader header = 1;
+    repeated LeaseStatus leases = 2;
+}
+
+message LeaseStatus {
+    int64 id = 1;
+}

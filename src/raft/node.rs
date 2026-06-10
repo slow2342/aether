@@ -160,8 +160,10 @@ fn raft_event_loop(
         store.first_index().unwrap_or(1) == 1 && store.last_index().unwrap_or(0) == 0;
     if needs_bootstrap {
         let voter_ids: Vec<u64> = initial_peers.iter().map(|(id, _)| *id).collect();
-        let mut cs = raft::eraftpb::ConfState::default();
-        cs.voters = voter_ids;
+        let cs = raft::eraftpb::ConfState {
+            voters: voter_ids,
+            ..Default::default()
+        };
         if let Err(e) = store.save_conf_state(&cs) {
             tracing::error!(error = %e, "failed to save initial ConfState");
             return;
