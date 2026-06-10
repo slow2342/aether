@@ -50,14 +50,10 @@ jobs:
       - run: cargo fmt -- --check
 
   build:
-    name: Build (${{ matrix.runner }})
+    name: Build
     if: needs.changes.outputs.code == 'true'
     needs: changes
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-latest-arm]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
@@ -65,20 +61,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: Linux-X64-cargo-${{ hashFiles('**/Cargo.lock') }}
           cache-targets: true
       - run: cargo build --all-targets
 
   build-nightly:
-    name: Build (${{ matrix.runner }}, nightly)
+    name: Build (nightly)
     if: needs.changes.outputs.code == 'true'
     needs: changes
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-latest-arm]
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
@@ -86,7 +78,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          key: Linux-X64-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
           cache-targets: true
       - run: cargo build --all-targets
 
@@ -108,13 +100,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test (${{ matrix.runner }})
+    name: Test
     needs: build
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-latest-arm]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
@@ -122,7 +110,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: Linux-X64-cargo-${{ hashFiles('**/Cargo.lock') }}
           cache-targets: true
       - run: cargo test --all-targets
       - run: cargo test --doc
