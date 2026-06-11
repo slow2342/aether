@@ -35,6 +35,10 @@ pub struct ClusterConfig {
 
     #[serde(default = "default_election_timeout")]
     pub election_timeout_ms: u64,
+
+    /// Number of committed log entries that triggers a snapshot.
+    #[serde(default = "default_snapshot_trigger")]
+    pub snapshot_trigger_log_entries: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +88,10 @@ fn default_election_timeout() -> u64 {
     10000
 }
 
+fn default_snapshot_trigger() -> u64 {
+    10000
+}
+
 fn default_token_expiry() -> u64 {
     24
 }
@@ -104,6 +112,7 @@ impl Default for ClusterConfig {
             peers: Vec::new(),
             heartbeat_interval_ms: default_heartbeat_interval(),
             election_timeout_ms: default_election_timeout(),
+            snapshot_trigger_log_entries: default_snapshot_trigger(),
         }
     }
 }

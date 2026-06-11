@@ -165,14 +165,6 @@ mod tests {
         }
     }
 
-    fn write_perm(key: &[u8], range_end: &[u8]) -> Permission {
-        Permission {
-            perm_type: PermissionType::Write,
-            key: key.to_vec(),
-            range_end: range_end.to_vec(),
-        }
-    }
-
     #[test]
     fn test_single_key_match() {
         let p = read_perm(b"/app/a", b"");

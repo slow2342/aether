@@ -252,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
         state_machine,
         msg_out_tx,
         initial_peers.clone(),
+        config.cluster.snapshot_trigger_log_entries,
     )?;
 
     tracing::info!("Raft event loop started");

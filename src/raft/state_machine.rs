@@ -12,6 +12,17 @@ use crate::storage::mvcc::{
 };
 use crate::storage::{RocksStorage, StorageEngine};
 
+/// Snapshot data containing all user-data column families.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SnapshotCfData {
+    default_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    mvcc_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    meta_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    lease_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    lease_keys_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    key_lease_entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 /// Per-key metadata tracked in memory and persisted to the meta CF.
 #[derive(Debug, Clone)]
 pub struct KeyMeta {
@@ -1619,6 +1630,195 @@ impl AetherStateMachine {
         RaftResponse::AuthDisable {}
     }
 
+    /// Maximum allowed snapshot size (512 MiB).  Prevents OOM when the database
+    /// is larger than available memory.  The serialized snapshot is typically
+    /// 1-2x the raw CF data size, so this limits total memory to ~1.5 GiB.
+    const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
+
+    /// Serialize the current state machine state into snapshot bytes.
+    ///
+    /// Captures all user-data column families (default, mvcc, meta, lease,
+    /// lease_keys, key_lease) so a follower can restore from this blob alone.
+    ///
+    /// This is a free function (not `&self`) because it only reads from
+    /// RocksDB, which is thread-safe.  Callers do **not** need to hold the
+    /// state machine lock, avoiding event-loop stalls during large scans.
+    ///
+    /// Returns an error if the cumulative CF data exceeds [`MAX_SNAPSHOT_BYTES`].
+    pub fn create_snapshot(storage: &RocksStorage) -> Result<Vec<u8>, String> {
+        let db = storage.db();
+        let mut total_bytes: usize = 0;
+
+        let default_entries = Self::cf_to_vec_checked(db, storage.default_cf(), &mut total_bytes)
+            .map_err(|e| format!("snapshot default CF: {e}"))?;
+        let mvcc_entries = Self::cf_to_vec_checked(db, storage.mvcc_cf(), &mut total_bytes)
+            .map_err(|e| format!("snapshot mvcc CF: {e}"))?;
+        let meta_entries = Self::cf_to_vec_checked(db, storage.meta_cf(), &mut total_bytes)
+            .map_err(|e| format!("snapshot meta CF: {e}"))?;
+        let lease_entries = Self::cf_to_vec_checked(db, storage.lease_cf(), &mut total_bytes)
+            .map_err(|e| format!("snapshot lease CF: {e}"))?;
+        let lease_keys_entries =
+            Self::cf_to_vec_checked(db, storage.lease_keys_cf(), &mut total_bytes)
+                .map_err(|e| format!("snapshot lease_keys CF: {e}"))?;
+        let key_lease_entries =
+            Self::cf_to_vec_checked(db, storage.key_lease_cf(), &mut total_bytes)
+                .map_err(|e| format!("snapshot key_lease CF: {e}"))?;
+
+        let snapshot = SnapshotCfData {
+            default_entries,
+            mvcc_entries,
+            meta_entries,
+            lease_entries,
+            lease_keys_entries,
+            key_lease_entries,
+        };
+
+        bincode::serialize(&snapshot).map_err(|e| format!("serialize snapshot: {e}"))
+    }
+
+    /// Restore state machine from snapshot bytes, replacing all existing data.
+    ///
+    /// Clears the user-data column families, replays the snapshot entries, and
+    /// rebuilds the in-memory indexes (`key_indexes`, `key_metas`, `key_leases`)
+    /// plus the `LeaseManager`.
+    ///
+    /// The entire operation (clear + write) is performed in a single RocksDB
+    /// WriteBatch for atomicity — a crash at any point leaves the database in
+    /// either the old state or the new state, never a partial mix.
+    pub fn restore_snapshot(&mut self, data: &[u8], applied_index: u64) -> Result<(), String> {
+        // Reject oversized snapshots before attempting deserialization to prevent
+        // unbounded memory allocation from a corrupt/malicious payload.
+        if data.len() > Self::MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "snapshot payload ({} bytes) exceeds {} MiB limit",
+                data.len(),
+                Self::MAX_SNAPSHOT_BYTES / (1024 * 1024),
+            ));
+        }
+        let snapshot: SnapshotCfData =
+            bincode::deserialize(data).map_err(|e| format!("deserialize snapshot: {e}"))?;
+
+        let db = self.storage.db();
+
+        // Build a single atomic batch: delete all existing keys from user CFs,
+        // then write all snapshot entries.  If the process crashes before the
+        // batch is committed, the old data is untouched.
+        let mut batch = WriteBatch::default();
+
+        // Delete existing keys from all user-data column families.
+        Self::delete_cf_keys(&mut batch, db, self.storage.default_cf())
+            .map_err(|e| format!("collect default CF keys: {e}"))?;
+        Self::delete_cf_keys(&mut batch, db, self.storage.mvcc_cf())
+            .map_err(|e| format!("collect mvcc CF keys: {e}"))?;
+        Self::delete_cf_keys(&mut batch, db, self.storage.meta_cf())
+            .map_err(|e| format!("collect meta CF keys: {e}"))?;
+        Self::delete_cf_keys(&mut batch, db, self.storage.lease_cf())
+            .map_err(|e| format!("collect lease CF keys: {e}"))?;
+        Self::delete_cf_keys(&mut batch, db, self.storage.lease_keys_cf())
+            .map_err(|e| format!("collect lease_keys CF keys: {e}"))?;
+        Self::delete_cf_keys(&mut batch, db, self.storage.key_lease_cf())
+            .map_err(|e| format!("collect key_lease CF keys: {e}"))?;
+
+        // Write all snapshot entries.
+        Self::load_batch(
+            &mut batch,
+            self.storage.default_cf(),
+            &snapshot.default_entries,
+        );
+        Self::load_batch(&mut batch, self.storage.mvcc_cf(), &snapshot.mvcc_entries);
+        Self::load_batch(&mut batch, self.storage.meta_cf(), &snapshot.meta_entries);
+        Self::load_batch(&mut batch, self.storage.lease_cf(), &snapshot.lease_entries);
+        Self::load_batch(
+            &mut batch,
+            self.storage.lease_keys_cf(),
+            &snapshot.lease_keys_entries,
+        );
+        Self::load_batch(
+            &mut batch,
+            self.storage.key_lease_cf(),
+            &snapshot.key_lease_entries,
+        );
+
+        // Commit atomically.
+        db.write(batch)
+            .map_err(|e| format!("write snapshot batch: {e}"))?;
+
+        // Rebuild in-memory state from persisted data.
+        self.key_indexes = load_key_indexes(db, self.storage.mvcc_cf())
+            .map_err(|e| format!("reload key indexes: {e}"))?;
+        self.key_metas = Self::load_key_metas_from_indexes(&self.storage, &self.key_indexes);
+        self.key_leases = Self::load_key_leases_from_meta(&self.key_metas);
+
+        // Rebuild lease manager from persisted lease data.
+        {
+            let mut mgr = self.lease_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&self.lease_store) {
+                tracing::warn!(error = %e, "failed to restore lease manager from snapshot");
+            }
+        }
+
+        self.last_applied = applied_index;
+        tracing::info!(
+            applied_index,
+            keys = self.key_metas.len(),
+            "restored from snapshot"
+        );
+        Ok(())
+    }
+
+    /// Read all key-value pairs from a column family, accumulating total byte
+    /// count.  Returns an error if the running total exceeds
+    /// [`MAX_SNAPSHOT_BYTES`].
+    #[allow(clippy::type_complexity)]
+    fn cf_to_vec_checked(
+        db: &rocksdb::DB,
+        cf: &rocksdb::ColumnFamily,
+        total_bytes: &mut usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut entries = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(|e| format!("iterator error: {e}"))?;
+            let entry_size = k.len() + v.len();
+            // Check BEFORE allocating to avoid exceeding the limit in memory.
+            if *total_bytes + entry_size > Self::MAX_SNAPSHOT_BYTES {
+                return Err(format!(
+                    "snapshot data exceeds {} MiB limit (at least {} bytes so far)",
+                    Self::MAX_SNAPSHOT_BYTES / (1024 * 1024),
+                    *total_bytes + entry_size,
+                ));
+            }
+            *total_bytes += entry_size;
+            entries.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(entries)
+    }
+
+    /// Enqueue delete operations for all keys in a column family into `batch`.
+    fn delete_cf_keys(
+        batch: &mut WriteBatch,
+        db: &rocksdb::DB,
+        cf: &rocksdb::ColumnFamily,
+    ) -> Result<(), rocksdb::Error> {
+        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (k, _) = item?;
+            batch.delete_cf(cf, &k);
+        }
+        Ok(())
+    }
+
+    /// Load snapshot entries into a WriteBatch.
+    fn load_batch(
+        batch: &mut WriteBatch,
+        cf: &rocksdb::ColumnFamily,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) {
+        for (k, v) in entries {
+            batch.put_cf(cf, k, v);
+        }
+    }
+
     /// Apply a normal entry's data (after request_id prefix) for raft-rs.
     /// `revision` is the Raft log entry index, used as the MVCC global revision.
     /// Returns serialized RaftResponse, or an error string on deserialization failure.
@@ -2949,5 +3149,132 @@ mod tests {
             other => panic!("expected Txn, got: {other:?}"),
         }
         assert!(sm.key_metas.contains_key(b"result".as_slice()));
+    }
+
+    #[test]
+    fn test_create_and_restore_snapshot_roundtrip() {
+        let (_dir, storage, mut sm) = setup();
+
+        // Write some data.
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"key1".to_vec(),
+                value: b"val1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"key2".to_vec(),
+                value: b"val2".to_vec(),
+                lease_id: 0,
+            },
+            2,
+        );
+
+        // Create snapshot (uses storage directly, no lock needed).
+        let snapshot_data = AetherStateMachine::create_snapshot(&storage).unwrap();
+        assert!(!snapshot_data.is_empty());
+
+        // Create a fresh state machine from the same storage to verify restore.
+        let lease_store2 = LeaseStore::new(storage.clone());
+        let (lease_manager2, _rx2) = LeaseManager::new(10000, 1);
+        let lease_manager2 = Arc::new(Mutex::new(lease_manager2));
+        let (tx2, _rx2) = tokio::sync::broadcast::channel(64);
+        let auth_cache2 = Arc::new(AuthCache::new());
+        let auth_enabled2 = Arc::new(AtomicBool::new(false));
+        let mut sm2 = AetherStateMachine::new(
+            tx2,
+            storage.clone(),
+            lease_manager2,
+            lease_store2,
+            auth_cache2,
+            auth_enabled2,
+        );
+
+        // Write different data to sm2 to verify it gets overwritten.
+        sm2.apply_request(
+            RaftRequest::Put {
+                key: b"other".to_vec(),
+                value: b"data".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        // Restore from snapshot.
+        sm2.restore_snapshot(&snapshot_data, 2).unwrap();
+
+        // Verify data matches original.
+        assert_eq!(storage.get(b"key1").unwrap(), Some(b"val1".to_vec()));
+        assert_eq!(storage.get(b"key2").unwrap(), Some(b"val2".to_vec()));
+        // The "other" key should be gone (cleared by restore).
+        assert_eq!(storage.get(b"other").unwrap(), None);
+        assert_eq!(sm2.last_applied, 2);
+        assert!(sm2.key_metas.contains_key(b"key1".as_slice()));
+        assert!(sm2.key_metas.contains_key(b"key2".as_slice()));
+    }
+
+    #[test]
+    fn test_snapshot_preserves_lease_associations() {
+        let (_dir, storage, mut sm) = setup();
+
+        // Grant a lease.
+        let resp = sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 60,
+                expiry_time: now_millis() + 60_000,
+            },
+            1,
+        );
+        let lease_id = match resp {
+            RaftResponse::LeaseGrant { id, .. } => id,
+            other => panic!("expected LeaseGrant, got: {other:?}"),
+        };
+
+        // Attach a key to the lease.
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"leased_key".to_vec(),
+                value: b"val".to_vec(),
+                lease_id,
+            },
+            2,
+        );
+
+        // Create snapshot.
+        let snapshot_data = AetherStateMachine::create_snapshot(&storage).unwrap();
+
+        // Restore to a fresh state machine.
+        let lease_store2 = LeaseStore::new(storage.clone());
+        let (lease_manager2, _rx2) = LeaseManager::new(10000, 1);
+        let lease_manager2 = Arc::new(Mutex::new(lease_manager2));
+        let (tx2, _rx2) = tokio::sync::broadcast::channel(64);
+        let auth_cache2 = Arc::new(AuthCache::new());
+        let auth_enabled2 = Arc::new(AtomicBool::new(false));
+        let mut sm2 = AetherStateMachine::new(
+            tx2,
+            storage.clone(),
+            lease_manager2,
+            lease_store2,
+            auth_cache2,
+            auth_enabled2,
+        );
+
+        sm2.restore_snapshot(&snapshot_data, 2).unwrap();
+
+        // Verify lease association survived the roundtrip.
+        assert_eq!(
+            sm2.key_leases.get(b"leased_key".as_slice()),
+            Some(&lease_id)
+        );
+        let mgr = sm2.lease_manager.lock().unwrap();
+        assert!(mgr.get(lease_id).is_some());
+        assert!(
+            mgr.get_keys(lease_id)
+                .unwrap()
+                .contains(b"leased_key".as_slice())
+        );
     }
 }

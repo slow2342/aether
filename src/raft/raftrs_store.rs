@@ -201,7 +201,7 @@ impl RaftRsStore {
         Ok(())
     }
 
-    fn snapshot_last_index(&self) -> u64 {
+    pub fn snapshot_last_index(&self) -> u64 {
         self.db
             .get_cf(self.state_cf(), b"snapshot_index")
             .ok()
@@ -214,6 +214,95 @@ impl RaftRsStore {
                 }
             })
             .unwrap_or(0)
+    }
+
+    /// Save snapshot data and metadata to raft_state CF.
+    /// Called by the event loop after the state machine creates a snapshot.
+    ///
+    /// **Does not update `first_index_cache`** — callers that also purge log
+    /// entries (e.g. `apply_snapshot`, `compact`) must handle cache invalidation
+    /// themselves to avoid stale cache values preventing log purge.
+    pub fn save_snapshot_data(
+        &self,
+        data: &[u8],
+        index: u64,
+        term: u64,
+        conf_state: &ConfState,
+    ) -> RaftResult<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(self.state_cf(), b"snapshot_data", data);
+        batch.put_cf(self.state_cf(), b"snapshot_index", index.to_be_bytes());
+        batch.put_cf(self.state_cf(), b"snapshot_term", term.to_be_bytes());
+        let mut cs_bytes = Vec::with_capacity(conf_state.encoded_len());
+        conf_state
+            .encode(&mut cs_bytes)
+            .map_err(|e| RaftError::Store(StorageError::Other(e.into())))?;
+        batch.put_cf(self.state_cf(), b"snapshot_conf_state", cs_bytes);
+
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(batch, &opts)
+            .map_err(|e| RaftError::Store(StorageError::Other(e.into())))?;
+
+        // Invalidate first_index cache so next call recomputes from storage.
+        // Do NOT set it to index+1 here — the caller may still need to purge
+        // log entries, and a stale cache would skip that purge.
+        self.first_index_cache.store(0, Ordering::Relaxed);
+        if index > self.last_index_cache.load(Ordering::Relaxed) {
+            self.last_index_cache.store(index, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Load snapshot data from raft_state CF (returns None if not found).
+    pub fn load_snapshot_data(&self) -> RaftResult<Option<Vec<u8>>> {
+        match self
+            .db
+            .get_cf(self.state_cf(), b"snapshot_data")
+            .map_err(|e| RaftError::Store(StorageError::Other(e.into())))?
+        {
+            Some(data) => Ok(Some(data.to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Apply an incoming snapshot from the leader.
+    /// Persists snapshot data, metadata, and purges log entries that are
+    /// superseded by the snapshot.
+    pub fn apply_snapshot(
+        &self,
+        meta: &raft::eraftpb::SnapshotMetadata,
+        data: &[u8],
+    ) -> RaftResult<()> {
+        let index = meta.index;
+        let term = meta.term;
+        let conf_state = meta.conf_state.as_ref().cloned().unwrap_or_default();
+
+        // Save snapshot data + metadata.
+        self.save_snapshot_data(data, index, term, &conf_state)?;
+
+        // Purge log entries up to (and including) the snapshot index.
+        let first = self.first_index().unwrap_or(1);
+        if index >= first {
+            let mut batch = rocksdb::WriteBatch::default();
+            for idx in first..=index {
+                batch.delete_cf(self.log_cf(), Self::log_key(idx));
+            }
+            batch.put_cf(self.state_cf(), b"last_purged", index.to_be_bytes());
+            let mut opts = rocksdb::WriteOptions::default();
+            opts.set_sync(true);
+            self.db
+                .write_opt(batch, &opts)
+                .map_err(|e| RaftError::Store(StorageError::Other(e.into())))?;
+            self.first_index_cache.store(index + 1, Ordering::Relaxed);
+        }
+
+        // Save the conf state from the snapshot metadata.
+        self.save_conf_state(&conf_state)?;
+
+        tracing::info!(index, term, "applied snapshot to store");
+        Ok(())
     }
 
     fn snapshot_last_term(&self) -> u64 {
@@ -320,6 +409,17 @@ impl Storage for RaftRsStore {
         }
 
         let first = self.first_index()?;
+
+        // Invariant: when a snapshot exists (snap_idx > 0), all log entries at
+        // or below snap_idx must have been purged, so first_index > snap_idx.
+        // This ensures the idx == snap_idx check above is the only path that
+        // returns the snapshot term; indices below first always get Compacted.
+        debug_assert!(
+            snap_idx == 0 || first > snap_idx,
+            "invariant violated: snap_idx={snap_idx} but first_index={first}. \
+             Log entries may not have been properly purged after snapshot.",
+        );
+
         if idx < first {
             return Err(RaftError::Store(StorageError::Compacted));
         }
@@ -361,11 +461,15 @@ impl Storage for RaftRsStore {
         Ok(idx)
     }
 
-    fn snapshot(&self, request_index: u64, _to: u64) -> RaftResult<Snapshot> {
+    fn snapshot(&self, _request_index: u64, _to: u64) -> RaftResult<Snapshot> {
         let mut snapshot = Snapshot::default();
 
+        let snap_idx = self.snapshot_last_index();
         let last_idx = self.last_index()?;
-        let commit_idx = std::cmp::max(last_idx, request_index);
+
+        // Use whichever index we actually have data for.  Never claim coverage
+        // beyond the last committed log entry.
+        let commit_idx = std::cmp::max(snap_idx, last_idx);
 
         let meta = snapshot.mut_metadata();
         meta.index = commit_idx;
@@ -377,6 +481,11 @@ impl Storage for RaftRsStore {
 
         if let Ok(RaftState { conf_state, .. }) = self.initial_state() {
             meta.set_conf_state(conf_state);
+        }
+
+        // Include snapshot data if we have it.
+        if let Ok(Some(data)) = self.load_snapshot_data() {
+            snapshot.data = data;
         }
 
         Ok(snapshot)
@@ -577,5 +686,77 @@ mod tests {
         let (_dir, store) = open_store();
         store.append_entries(&[]).unwrap();
         assert_eq!(store.last_index().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_save_and_load_snapshot_data() {
+        let (_dir, store) = open_store();
+        let data = b"hello snapshot".to_vec();
+        let mut cs = ConfState::default();
+        cs.set_voters(vec![1]);
+
+        store.save_snapshot_data(&data, 10, 3, &cs).unwrap();
+
+        let loaded = store.load_snapshot_data().unwrap();
+        assert_eq!(loaded, Some(data));
+
+        // Verify metadata was updated.
+        assert_eq!(store.snapshot_last_index(), 10);
+        assert_eq!(store.first_index().unwrap(), 11);
+    }
+
+    #[test]
+    fn test_snapshot_includes_data_after_save() {
+        let (_dir, store) = open_store();
+        let entries = vec![make_entry(1, 1, b"e1"), make_entry(2, 2, b"e2")];
+        store.append_entries(&entries).unwrap();
+
+        let data = b"snapshot payload".to_vec();
+        let mut cs = ConfState::default();
+        cs.set_voters(vec![1]);
+        store.save_snapshot_data(&data, 2, 2, &cs).unwrap();
+
+        let snap = store.snapshot(0, 0).unwrap();
+        assert_eq!(snap.get_data(), data.as_slice());
+        assert_eq!(snap.get_metadata().index, 2);
+        assert_eq!(snap.get_metadata().term, 2);
+    }
+
+    #[test]
+    fn test_apply_snapshot_persists_and_purges_log() {
+        let (_dir, store) = open_store();
+        let entries = vec![
+            make_entry(1, 1, b"e1"),
+            make_entry(2, 1, b"e2"),
+            make_entry(3, 1, b"e3"),
+        ];
+        store.append_entries(&entries).unwrap();
+
+        let data = b"leader snapshot".to_vec();
+        let mut meta = raft::eraftpb::SnapshotMetadata::default();
+        meta.index = 5;
+        meta.term = 2;
+        let mut cs = ConfState::default();
+        cs.set_voters(vec![1, 2, 3]);
+        meta.set_conf_state(cs);
+
+        store.apply_snapshot(&meta, &data).unwrap();
+
+        // Snapshot data should be persisted.
+        assert_eq!(store.load_snapshot_data().unwrap(), Some(data));
+
+        // Log entries should be purged.
+        assert_eq!(store.first_index().unwrap(), 6);
+
+        // Old entries should be gone.
+        let result = store.entries(1, 4, None, GetEntriesContext::empty(false));
+        assert!(matches!(
+            result,
+            Err(e) if matches!(e, raft::Error::Store(raft::StorageError::Compacted))
+        ));
+
+        // Conf state from snapshot metadata should be saved.
+        let state = store.initial_state().unwrap();
+        assert_eq!(state.conf_state.voters, vec![1, 2, 3]);
     }
 }
