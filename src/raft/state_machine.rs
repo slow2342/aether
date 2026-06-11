@@ -115,7 +115,29 @@ impl TxnSnapshot {
     /// lease_manager to match the saved per-key lease state.
     /// Called when `db.write(batch)` fails.
     fn rollback(self, sm: &mut AetherStateMachine) {
-        // Restore key_metas, key_indexes, key_leases first.
+        // Reconcile lease_manager FIRST, before restoring key_leases.
+        // At this point, key_leases still reflects the failed mutation,
+        // so we can detect what changed and reverse it.
+        let mut mgr = sm.lease_manager.lock().unwrap();
+        for (key, initial_lease) in &self.lease {
+            let mutated_lease = sm.key_leases.get(key).copied();
+            match (*initial_lease, mutated_lease) {
+                (Some(init_id), Some(mut_id)) if init_id != mut_id => {
+                    mgr.detach_key(mut_id, key);
+                    mgr.attach_key(init_id, key.clone());
+                }
+                (None, Some(mut_id)) => {
+                    mgr.detach_key(mut_id, key);
+                }
+                (Some(init_id), None) => {
+                    mgr.attach_key(init_id, key.clone());
+                }
+                _ => {}
+            }
+        }
+        drop(mgr);
+
+        // Now restore key_metas, key_indexes, key_leases.
         for (key, old) in &self.meta {
             match old {
                 Some(m) => {
@@ -144,29 +166,6 @@ impl TxnSnapshot {
                 None => {
                     sm.key_leases.remove(key);
                 }
-            }
-        }
-
-        // Reconcile lease_manager: for each touched key, ensure the lease
-        // attachment matches the saved initial state.
-        let mut mgr = sm.lease_manager.lock().unwrap();
-        for (key, initial_lease) in &self.lease {
-            let current_lease = sm.key_leases.get(key).copied();
-            match (*initial_lease, current_lease) {
-                (Some(init_id), Some(cur_id)) if init_id != cur_id => {
-                    // Lease changed: detach current, attach initial.
-                    mgr.detach_key(cur_id, key);
-                    mgr.attach_key(init_id, key.clone());
-                }
-                (None, Some(cur_id)) => {
-                    // Had no lease, now has one: detach.
-                    mgr.detach_key(cur_id, key);
-                }
-                (Some(init_id), None) => {
-                    // Had lease, now has none: re-attach.
-                    mgr.attach_key(init_id, key.clone());
-                }
-                _ => {} // No change needed.
             }
         }
     }
@@ -596,44 +595,7 @@ impl AetherStateMachine {
                 let succeeded = compare.iter().all(|cmp| {
                     let meta = self.key_metas.get(&cmp.key);
                     let current_value = self.storage_get(&cmp.key);
-                    match (&cmp.target, &cmp.target_union) {
-                        (super::CompareTarget::Value, super::TargetUnion::Value(expected)) => {
-                            match cmp.result {
-                                super::CompareResult::Equal => {
-                                    current_value.as_deref() == Some(expected.as_slice())
-                                }
-                                super::CompareResult::NotEqual => {
-                                    current_value.as_deref() != Some(expected.as_slice())
-                                }
-                                super::CompareResult::Greater => current_value
-                                    .as_deref()
-                                    .is_some_and(|v| v > expected.as_slice()),
-                                super::CompareResult::Less => current_value
-                                    .as_deref()
-                                    .is_some_and(|v| v < expected.as_slice()),
-                            }
-                        }
-                        (super::CompareTarget::Version, super::TargetUnion::Version(expected)) => {
-                            let current = meta.map_or(0i64, |m| m.version);
-                            Self::compare_i64(cmp.result, current, *expected)
-                        }
-                        (
-                            super::CompareTarget::Create,
-                            super::TargetUnion::CreateRevision(expected),
-                        ) => {
-                            let current = meta.map_or(0i64, |m| m.create_revision);
-                            Self::compare_i64(cmp.result, current, *expected)
-                        }
-                        (super::CompareTarget::Mod, super::TargetUnion::ModRevision(expected)) => {
-                            let current = meta.map_or(0i64, |m| m.mod_revision);
-                            Self::compare_i64(cmp.result, current, *expected)
-                        }
-                        (super::CompareTarget::Lease, super::TargetUnion::Lease(expected)) => {
-                            let current = meta.map_or(0i64, |m| m.lease);
-                            Self::compare_i64(cmp.result, current, *expected)
-                        }
-                        _ => false,
-                    }
+                    Self::evaluate_compare(cmp, meta, current_value.as_deref())
                 });
 
                 // All sub-operations share a single WriteBatch for atomicity.
@@ -702,8 +664,11 @@ impl AetherStateMachine {
                                 let kvs = if get.range_end.is_empty() {
                                     match self.key_metas.get(&get.key) {
                                         Some(meta) => {
-                                            let value =
-                                                self.storage_get(&get.key).unwrap_or_default();
+                                            let value = value_cache
+                                                .get(&get.key)
+                                                .cloned()
+                                                .or_else(|| self.storage_get(&get.key))
+                                                .unwrap_or_default();
                                             vec![meta.to_kv(get.key.clone(), value)]
                                         }
                                         None => vec![],
@@ -717,7 +682,11 @@ impl AetherStateMachine {
                                                     || k.as_slice() < get.range_end.as_slice())
                                         })
                                         .map(|(k, meta)| {
-                                            let value = self.storage_get(k).unwrap_or_default();
+                                            let value = value_cache
+                                                .get(k)
+                                                .cloned()
+                                                .or_else(|| self.storage_get(k))
+                                                .unwrap_or_default();
                                             meta.to_kv(k.clone(), value)
                                         })
                                         .collect()
@@ -729,8 +698,11 @@ impl AetherStateMachine {
                                 let kvs: Vec<KeyValue> = if range.range_end.is_empty() {
                                     match self.key_metas.get(&range.key) {
                                         Some(meta) => {
-                                            let value =
-                                                self.storage_get(&range.key).unwrap_or_default();
+                                            let value = value_cache
+                                                .get(&range.key)
+                                                .cloned()
+                                                .or_else(|| self.storage_get(&range.key))
+                                                .unwrap_or_default();
                                             vec![meta.to_kv(range.key.clone(), value)]
                                         }
                                         None => vec![],
@@ -744,13 +716,192 @@ impl AetherStateMachine {
                                                     || k.as_slice() < range.range_end.as_slice())
                                         })
                                         .map(|(k, meta)| {
-                                            let value = self.storage_get(k).unwrap_or_default();
+                                            let value = value_cache
+                                                .get(k)
+                                                .cloned()
+                                                .or_else(|| self.storage_get(k))
+                                                .unwrap_or_default();
                                             meta.to_kv(k.clone(), value)
                                         })
                                         .collect()
                                 };
                                 let count = kvs.len() as i64;
                                 super::Response::Range(super::RangeResponse { kvs, count })
+                            }
+                            super::Request::Txn(inner) => {
+                                // Nested Txn: evaluate compares and execute sub-ops inline.
+                                let inner_succeeded = inner.compare.iter().all(|cmp| {
+                                    let meta = self.key_metas.get(&cmp.key);
+                                    let current_value = value_cache
+                                        .get(&cmp.key)
+                                        .cloned()
+                                        .or_else(|| self.storage_get(&cmp.key));
+                                    Self::evaluate_compare(cmp, meta, current_value.as_deref())
+                                });
+                                let inner_ops = if inner_succeeded {
+                                    &inner.success
+                                } else {
+                                    &inner.failure
+                                };
+                                let mut inner_responses = Vec::new();
+                                for inner_op in inner_ops {
+                                    if let Some(inner_req) = &inner_op.request {
+                                        let inner_resp = match inner_req {
+                                            super::Request::Put(p) => {
+                                                let prev_kv = match self.batch_put(
+                                                    &mut batch,
+                                                    &mut snapshot,
+                                                    &mut value_cache,
+                                                    p.key.clone(),
+                                                    &p.value,
+                                                    p.lease,
+                                                    revision,
+                                                ) {
+                                                    Ok(pk) => pk,
+                                                    Err(msg) => {
+                                                        snapshot.rollback(self);
+                                                        return RaftResponse::Error {
+                                                            message: format!(
+                                                                "nested txn put failed: {msg}"
+                                                            ),
+                                                        };
+                                                    }
+                                                };
+                                                let kv = self
+                                                    .key_metas
+                                                    .get(&p.key)
+                                                    .unwrap()
+                                                    .to_kv(p.key.clone(), p.value.clone());
+                                                watch_events.push(WatchEvent {
+                                                    event_type: super::WatchEventType::Put,
+                                                    kv,
+                                                    prev_kv: prev_kv.clone(),
+                                                });
+                                                super::Response::Put(super::PutResponse { prev_kv })
+                                            }
+                                            super::Request::Delete(d) => {
+                                                let (deleted, prev_kvs, evts) = match self
+                                                    .batch_delete(
+                                                        &mut batch,
+                                                        &mut snapshot,
+                                                        &mut value_cache,
+                                                        d.key.clone(),
+                                                        d.range_end.clone(),
+                                                        revision,
+                                                    ) {
+                                                    Ok(r) => r,
+                                                    Err(msg) => {
+                                                        snapshot.rollback(self);
+                                                        return RaftResponse::Error {
+                                                            message: format!(
+                                                                "nested txn delete failed: {msg}"
+                                                            ),
+                                                        };
+                                                    }
+                                                };
+                                                watch_events.extend(evts);
+                                                super::Response::Delete(super::DeleteResponse {
+                                                    deleted,
+                                                    prev_kvs,
+                                                })
+                                            }
+                                            super::Request::Get(g) => {
+                                                let kvs = if g.range_end.is_empty() {
+                                                    match self.key_metas.get(&g.key) {
+                                                        Some(m) => {
+                                                            let v = value_cache
+                                                                .get(&g.key)
+                                                                .cloned()
+                                                                .or_else(|| {
+                                                                    self.storage_get(&g.key)
+                                                                })
+                                                                .unwrap_or_default();
+                                                            vec![m.to_kv(g.key.clone(), v)]
+                                                        }
+                                                        None => vec![],
+                                                    }
+                                                } else {
+                                                    self.key_metas
+                                                        .iter()
+                                                        .filter(|(k, _)| {
+                                                            k.as_slice() >= g.key.as_slice()
+                                                                && (g.range_end == b"\0"
+                                                                    || k.as_slice()
+                                                                        < g.range_end.as_slice())
+                                                        })
+                                                        .map(|(k, m)| {
+                                                            let v = value_cache
+                                                                .get(k)
+                                                                .cloned()
+                                                                .or_else(|| self.storage_get(k))
+                                                                .unwrap_or_default();
+                                                            m.to_kv(k.clone(), v)
+                                                        })
+                                                        .collect()
+                                                };
+                                                let count = kvs.len() as i64;
+                                                super::Response::Get(super::RangeResponse {
+                                                    kvs,
+                                                    count,
+                                                })
+                                            }
+                                            super::Request::Range(r) => {
+                                                let kvs: Vec<KeyValue> = if r.range_end.is_empty() {
+                                                    match self.key_metas.get(&r.key) {
+                                                        Some(m) => {
+                                                            let v = value_cache
+                                                                .get(&r.key)
+                                                                .cloned()
+                                                                .or_else(|| {
+                                                                    self.storage_get(&r.key)
+                                                                })
+                                                                .unwrap_or_default();
+                                                            vec![m.to_kv(r.key.clone(), v)]
+                                                        }
+                                                        None => vec![],
+                                                    }
+                                                } else {
+                                                    self.key_metas
+                                                        .iter()
+                                                        .filter(|(k, _)| {
+                                                            k.as_slice() >= r.key.as_slice()
+                                                                && (r.range_end == b"\0"
+                                                                    || k.as_slice()
+                                                                        < r.range_end.as_slice())
+                                                        })
+                                                        .map(|(k, m)| {
+                                                            let v = value_cache
+                                                                .get(k)
+                                                                .cloned()
+                                                                .or_else(|| self.storage_get(k))
+                                                                .unwrap_or_default();
+                                                            m.to_kv(k.clone(), v)
+                                                        })
+                                                        .collect()
+                                                };
+                                                let count = kvs.len() as i64;
+                                                super::Response::Range(super::RangeResponse {
+                                                    kvs,
+                                                    count,
+                                                })
+                                            }
+                                            super::Request::Txn(_) => {
+                                                snapshot.rollback(self);
+                                                return RaftResponse::Error {
+                                                    message: "nested txn depth > 1 not supported"
+                                                        .into(),
+                                                };
+                                            }
+                                        };
+                                        inner_responses.push(super::ResponseOp {
+                                            response: Some(inner_resp),
+                                        });
+                                    }
+                                }
+                                super::Response::Txn(Box::new(super::TxnResponse {
+                                    succeeded: inner_succeeded,
+                                    responses: inner_responses,
+                                }))
                             }
                         };
                         responses.push(super::ResponseOp {
@@ -827,6 +978,44 @@ impl AetherStateMachine {
             super::CompareResult::NotEqual => current != expected,
             super::CompareResult::Greater => current > expected,
             super::CompareResult::Less => current < expected,
+        }
+    }
+
+    fn evaluate_compare(
+        cmp: &super::Compare,
+        meta: Option<&KeyMeta>,
+        current_value: Option<&[u8]>,
+    ) -> bool {
+        match (&cmp.target, &cmp.target_union) {
+            (super::CompareTarget::Value, super::TargetUnion::Value(expected)) => {
+                match cmp.result {
+                    super::CompareResult::Equal => current_value == Some(expected.as_slice()),
+                    super::CompareResult::NotEqual => current_value != Some(expected.as_slice()),
+                    super::CompareResult::Greater => {
+                        current_value.is_some_and(|v| v > expected.as_slice())
+                    }
+                    super::CompareResult::Less => {
+                        current_value.is_some_and(|v| v < expected.as_slice())
+                    }
+                }
+            }
+            (super::CompareTarget::Version, super::TargetUnion::Version(expected)) => {
+                let current = meta.map_or(0i64, |m| m.version);
+                Self::compare_i64(cmp.result, current, *expected)
+            }
+            (super::CompareTarget::Create, super::TargetUnion::CreateRevision(expected)) => {
+                let current = meta.map_or(0i64, |m| m.create_revision);
+                Self::compare_i64(cmp.result, current, *expected)
+            }
+            (super::CompareTarget::Mod, super::TargetUnion::ModRevision(expected)) => {
+                let current = meta.map_or(0i64, |m| m.mod_revision);
+                Self::compare_i64(cmp.result, current, *expected)
+            }
+            (super::CompareTarget::Lease, super::TargetUnion::Lease(expected)) => {
+                let current = meta.map_or(0i64, |m| m.lease);
+                Self::compare_i64(cmp.result, current, *expected)
+            }
+            _ => false,
         }
     }
 
@@ -1434,15 +1623,12 @@ impl AetherStateMachine {
     /// `revision` is the Raft log entry index, used as the MVCC global revision.
     /// Returns serialized RaftResponse, or an error string on deserialization failure.
     pub fn apply_normal_entry(&mut self, data: &[u8], revision: u64) -> Result<Vec<u8>, String> {
-        let request: RaftRequest = rkyv::from_bytes::<RaftRequest, rkyv::rancor::BoxedError>(data)
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to deserialize RaftRequest");
-                format!("deserialize failed: {e}")
-            })?;
+        let request: RaftRequest = bincode::deserialize(data).map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize RaftRequest");
+            format!("deserialize failed: {e}")
+        })?;
         let response = self.apply_request(request, revision);
-        rkyv::to_bytes::<rkyv::rancor::BoxedError>(&response)
-            .map(|b| b.into_vec())
-            .map_err(|e| format!("serialize failed: {e}"))
+        bincode::serialize(&response).map_err(|e| format!("serialize failed: {e}"))
     }
 
     /// Apply a configuration change for raft-rs.
@@ -1627,13 +1813,10 @@ mod tests {
             value: b"v".to_vec(),
             lease_id: 0,
         };
-        let data = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&req)
-            .unwrap()
-            .into_vec();
+        let data = bincode::serialize(&req).unwrap();
 
         let resp_bytes = sm.apply_normal_entry(&data, 1).unwrap();
-        let resp: RaftResponse =
-            rkyv::from_bytes::<RaftResponse, rkyv::rancor::BoxedError>(&resp_bytes).unwrap();
+        let resp: RaftResponse = bincode::deserialize(&resp_bytes).unwrap();
         match resp {
             RaftResponse::Put { prev_kv } => assert!(prev_kv.is_none()),
             other => panic!("expected Put, got: {other:?}"),
@@ -1982,5 +2165,789 @@ mod tests {
         let ev2 = rx.try_recv().unwrap();
         assert_eq!(ev2.event_type, WatchEventType::Put);
         assert!(rx.try_recv().is_err());
+    }
+
+    // --- CAS (Compare-And-Swap) tests ---
+
+    #[test]
+    fn test_cas_version_equal_success() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(succeeded);
+                assert_eq!(responses.len(), 1);
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert_eq!(sm.key_metas.get(b"k".as_slice()).unwrap().version, 2);
+    }
+
+    #[test]
+    fn test_cas_version_equal_failure() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(999),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"should-not-happen".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"fallback".to_vec(),
+                        value: b"executed".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(!succeeded);
+                assert_eq!(responses.len(), 1);
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert_eq!(sm.key_metas.get(b"k".as_slice()).unwrap().version, 1);
+        assert!(sm.key_metas.contains_key(b"fallback".as_slice()));
+    }
+
+    #[test]
+    fn test_cas_value_equal_success() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"expected".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Value,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Value(b"expected".to_vec()),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"updated".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_value_not_equal() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::NotEqual,
+                    target: raft::CompareTarget::Value,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Value(b"other".to_vec()),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_create_revision() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Create,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::CreateRevision(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_mod_revision() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Mod,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::ModRevision(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_lease_equal() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 10,
+                expiry_time: now_millis() + 10_000,
+            },
+            1,
+        );
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 1,
+            },
+            2,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Lease,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Lease(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            3,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_greater_than() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v2".to_vec(),
+                lease_id: 0,
+            },
+            2,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Greater,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v3".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            3,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_less_than() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Less,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(5),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_multiple_compares() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                lease_id: 0,
+            },
+            2,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![
+                    raft::Compare {
+                        result: raft::CompareResult::Equal,
+                        target: raft::CompareTarget::Version,
+                        key: b"k1".to_vec(),
+                        target_union: raft::TargetUnion::Version(1),
+                    },
+                    raft::Compare {
+                        result: raft::CompareResult::Equal,
+                        target: raft::CompareTarget::Value,
+                        key: b"k2".to_vec(),
+                        target_union: raft::TargetUnion::Value(b"v2".to_vec()),
+                    },
+                ],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"result".to_vec(),
+                        value: b"ok".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            3,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert!(sm.key_metas.contains_key(b"result".as_slice()));
+    }
+
+    #[test]
+    fn test_cas_multiple_compares_one_fails() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                lease_id: 0,
+            },
+            2,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![
+                    raft::Compare {
+                        result: raft::CompareResult::Equal,
+                        target: raft::CompareTarget::Version,
+                        key: b"k1".to_vec(),
+                        target_union: raft::TargetUnion::Version(1),
+                    },
+                    raft::Compare {
+                        result: raft::CompareResult::Equal,
+                        target: raft::CompareTarget::Value,
+                        key: b"k2".to_vec(),
+                        target_union: raft::TargetUnion::Value(b"wrong".to_vec()),
+                    },
+                ],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"should-not-exist".to_vec(),
+                        value: b"nope".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"fallback".to_vec(),
+                        value: b"executed".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+            },
+            3,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(!succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert!(!sm.key_metas.contains_key(b"should-not-exist".as_slice()));
+        assert!(sm.key_metas.contains_key(b"fallback".as_slice()));
+    }
+
+    #[test]
+    fn test_cas_nonexistent_key_version_zero() {
+        let (_dir, _storage, mut sm) = setup();
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Version,
+                    key: b"no-such-key".to_vec(),
+                    target_union: raft::TargetUnion::Version(0),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Put(raft::PutRequest {
+                        key: b"no-such-key".to_vec(),
+                        value: b"created".to_vec(),
+                        lease: 0,
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            1,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert!(sm.key_metas.contains_key(b"no-such-key".as_slice()));
+    }
+
+    #[test]
+    fn test_cas_get_in_success_branch() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Get(raft::RangeRequest {
+                        key: b"k".to_vec(),
+                        range_end: vec![],
+                        limit: 0,
+                        revision: 0,
+                        sort_order: raft::SortOrder::None,
+                        sort_target: raft::SortTarget::Key,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(succeeded);
+                assert_eq!(responses.len(), 1);
+                match &responses[0].response {
+                    Some(raft::Response::Get(r)) => {
+                        assert_eq!(r.kvs.len(), 1);
+                        assert_eq!(r.kvs[0].key, b"k");
+                    }
+                    other => panic!("expected Get response, got: {other:?}"),
+                }
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cas_delete_in_success_branch() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Delete(raft::DeleteRequest {
+                        key: b"k".to_vec(),
+                        range_end: vec![],
+                        prev_kv: false,
+                    })),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn { succeeded, .. } => assert!(succeeded),
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert!(!sm.key_metas.contains_key(b"k".as_slice()));
+    }
+
+    #[test]
+    fn test_nested_txn() {
+        let (_dir, _storage, mut sm) = setup();
+
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        // Outer Txn: if version == 1, execute inner Txn that puts two keys.
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![raft::Compare {
+                    result: raft::CompareResult::Equal,
+                    target: raft::CompareTarget::Version,
+                    key: b"k".to_vec(),
+                    target_union: raft::TargetUnion::Version(1),
+                }],
+                success: vec![raft::RequestOp {
+                    request: Some(raft::Request::Txn(Box::new(raft::TxnRequest {
+                        compare: vec![],
+                        success: vec![
+                            raft::RequestOp {
+                                request: Some(raft::Request::Put(raft::PutRequest {
+                                    key: b"nk1".to_vec(),
+                                    value: b"nv1".to_vec(),
+                                    lease: 0,
+                                    prev_kv: false,
+                                })),
+                            },
+                            raft::RequestOp {
+                                request: Some(raft::Request::Put(raft::PutRequest {
+                                    key: b"nk2".to_vec(),
+                                    value: b"nv2".to_vec(),
+                                    lease: 0,
+                                    prev_kv: false,
+                                })),
+                            },
+                        ],
+                        failure: vec![],
+                    }))),
+                }],
+                failure: vec![],
+            },
+            2,
+        );
+
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(succeeded);
+                assert_eq!(responses.len(), 1);
+                // The inner response should be a Txn response.
+                match &responses[0].response {
+                    Some(raft::Response::Txn(inner)) => {
+                        assert!(inner.succeeded);
+                        assert_eq!(inner.responses.len(), 2);
+                    }
+                    other => panic!("expected nested Txn response, got: {other:?}"),
+                }
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert!(sm.key_metas.contains_key(b"nk1".as_slice()));
+        assert!(sm.key_metas.contains_key(b"nk2".as_slice()));
+    }
+
+    #[test]
+    fn test_nested_txn_compare_reads_uncommitted_value() {
+        let (_dir, _storage, mut sm) = setup();
+
+        // Outer Txn: Put "k" = "new", then nested Txn checks value == "new".
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![],
+                success: vec![
+                    raft::RequestOp {
+                        request: Some(raft::Request::Put(raft::PutRequest {
+                            key: b"k".to_vec(),
+                            value: b"new".to_vec(),
+                            lease: 0,
+                            prev_kv: false,
+                        })),
+                    },
+                    raft::RequestOp {
+                        request: Some(raft::Request::Txn(Box::new(raft::TxnRequest {
+                            compare: vec![raft::Compare {
+                                result: raft::CompareResult::Equal,
+                                target: raft::CompareTarget::Value,
+                                key: b"k".to_vec(),
+                                target_union: raft::TargetUnion::Value(b"new".to_vec()),
+                            }],
+                            success: vec![raft::RequestOp {
+                                request: Some(raft::Request::Put(raft::PutRequest {
+                                    key: b"result".to_vec(),
+                                    value: b"ok".to_vec(),
+                                    lease: 0,
+                                    prev_kv: false,
+                                })),
+                            }],
+                            failure: vec![],
+                        }))),
+                    },
+                ],
+                failure: vec![],
+            },
+            1,
+        );
+
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(succeeded);
+                assert_eq!(responses.len(), 2);
+                // Nested Txn should have succeeded (compare read uncommitted value).
+                match &responses[1].response {
+                    Some(raft::Response::Txn(inner)) => {
+                        assert!(inner.succeeded);
+                    }
+                    other => panic!("expected nested Txn response, got: {other:?}"),
+                }
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+        assert!(sm.key_metas.contains_key(b"result".as_slice()));
     }
 }

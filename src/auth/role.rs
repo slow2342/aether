@@ -142,6 +142,9 @@ pub fn extract_txn_keys(
                 crate::raft::Request::Get(g) => keys.push(g.key.clone()),
                 crate::raft::Request::Delete(d) => keys.push(d.key.clone()),
                 crate::raft::Request::Range(r) => keys.push(r.key.clone()),
+                crate::raft::Request::Txn(t) => {
+                    keys.extend(extract_txn_keys(&t.compare, &t.success, &t.failure));
+                }
             }
         }
     }

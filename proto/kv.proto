@@ -138,6 +138,7 @@ message RequestOp {
         GetRequest get = 2;
         DeleteRequest delete = 3;
         RangeRequest range = 4;
+        TxnRequest txn = 5;
     }
 }
 
@@ -148,6 +149,7 @@ message ResponseOp {
         GetResponse get = 2;
         DeleteResponse delete = 3;
         RangeResponse range = 4;
+        TxnResponse txn = 5;
     }
 }
 

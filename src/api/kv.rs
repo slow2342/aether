@@ -89,6 +89,67 @@ impl<S: StorageEngine> KvService<S> {
         key.starts_with(b"_aether_")
     }
 
+    /// Recursively check permissions for all operations in a Txn (including nested).
+    fn check_txn_ops_permissions(
+        auth: &AuthInterceptor,
+        username: &str,
+        compare: &[crate::proto::Compare],
+        success: &[crate::proto::RequestOp],
+        failure: &[crate::proto::RequestOp],
+    ) -> Result<(), Status> {
+        for cmp in compare {
+            auth.check_permission(username, &cmp.key, PermissionType::Read)?;
+        }
+        for op in success.iter().chain(failure.iter()) {
+            if let Some(r) = &op.request {
+                match r {
+                    crate::proto::request_op::Request::Put(p) => {
+                        if Self::is_reserved_key(&p.key) {
+                            return Err(Status::permission_denied(
+                                "keys starting with _aether_ are reserved",
+                            ));
+                        }
+                        auth.check_permission(username, &p.key, PermissionType::Write)?;
+                    }
+                    crate::proto::request_op::Request::Delete(d) => {
+                        if Self::is_reserved_key(&d.key) {
+                            return Err(Status::permission_denied(
+                                "keys starting with _aether_ are reserved",
+                            ));
+                        }
+                        if !d.range_end.is_empty() {
+                            auth.check_range_permission(
+                                username,
+                                &d.key,
+                                &d.range_end,
+                                PermissionType::Write,
+                            )?;
+                        } else {
+                            auth.check_permission(username, &d.key, PermissionType::Write)?;
+                        }
+                    }
+                    crate::proto::request_op::Request::Get(g) => {
+                        auth.check_permission(username, &g.key, PermissionType::Read)?;
+                    }
+                    crate::proto::request_op::Request::Range(r) => {
+                        auth.check_range_permission(
+                            username,
+                            &r.key,
+                            &r.range_end,
+                            PermissionType::Read,
+                        )?;
+                    }
+                    crate::proto::request_op::Request::Txn(t) => {
+                        Self::check_txn_ops_permissions(
+                            auth, username, &t.compare, &t.success, &t.failure,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Propose a write through Raft and return the response.
     async fn propose(&self, request: raft::RaftRequest) -> Result<raft::RaftResponse, Status> {
         require_leader(self.raft.as_ref(), self.node_id)?;
@@ -440,52 +501,24 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
                                 PermissionType::Read,
                             )?;
                         }
+                        crate::proto::request_op::Request::Txn(t) => {
+                            Self::check_txn_ops_permissions(
+                                &self.auth_interceptor,
+                                username,
+                                &t.compare,
+                                &t.success,
+                                &t.failure,
+                            )?;
+                        }
                     }
                 }
             }
         }
 
-        let compare: Vec<raft::Compare> = req
-            .compare
-            .into_iter()
-            .map(|c| raft::Compare {
-                result: match c.result() {
-                    crate::proto::CompareResult::Equal => raft::CompareResult::Equal,
-                    crate::proto::CompareResult::Greater => raft::CompareResult::Greater,
-                    crate::proto::CompareResult::Less => raft::CompareResult::Less,
-                    crate::proto::CompareResult::NotEqual => raft::CompareResult::NotEqual,
-                },
-                target: match c.target() {
-                    crate::proto::CompareTarget::Version => raft::CompareTarget::Version,
-                    crate::proto::CompareTarget::Create => raft::CompareTarget::Create,
-                    crate::proto::CompareTarget::Mod => raft::CompareTarget::Mod,
-                    crate::proto::CompareTarget::Value => raft::CompareTarget::Value,
-                    crate::proto::CompareTarget::Lease => raft::CompareTarget::Lease,
-                },
-                key: c.key,
-                target_union: match c.target_union {
-                    Some(crate::proto::compare::TargetUnion::Version(v)) => {
-                        raft::TargetUnion::Version(v)
-                    }
-                    Some(crate::proto::compare::TargetUnion::CreateRevision(v)) => {
-                        raft::TargetUnion::CreateRevision(v)
-                    }
-                    Some(crate::proto::compare::TargetUnion::ModRevision(v)) => {
-                        raft::TargetUnion::ModRevision(v)
-                    }
-                    Some(crate::proto::compare::TargetUnion::Value(v)) => {
-                        raft::TargetUnion::Value(v)
-                    }
-                    Some(crate::proto::compare::TargetUnion::Lease(v)) => {
-                        raft::TargetUnion::Lease(v)
-                    }
-                    None => raft::TargetUnion::Version(0),
-                },
-            })
-            .collect();
+        let compare = convert_compares(req.compare);
 
-        let success = convert_request_ops(req.success);
-        let failure = convert_request_ops(req.failure);
+        let success = convert_request_ops(req.success)?;
+        let failure = convert_request_ops(req.failure)?;
 
         let raft_req = raft::RaftRequest::Txn {
             compare,
@@ -573,6 +606,16 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
                                     count: r.count,
                                 },
                             ),
+                            raft::Response::Txn(t) => {
+                                let inner_responses = convert_response_ops(t.responses);
+                                crate::proto::response_op::Response::Txn(
+                                    crate::proto::TxnResponse {
+                                        header: None,
+                                        succeeded: t.succeeded,
+                                        responses: inner_responses,
+                                    },
+                                )
+                            }
                         });
                         crate::proto::ResponseOp { response }
                     })
@@ -590,45 +633,169 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
     }
 }
 
-fn convert_request_ops(ops: Vec<crate::proto::RequestOp>) -> Vec<raft::RequestOp> {
+/// Maximum nesting depth for transactions (1 = one level of nested Txn).
+const MAX_TXN_DEPTH: u32 = 1;
+
+fn convert_request_ops(ops: Vec<crate::proto::RequestOp>) -> Result<Vec<raft::RequestOp>, Status> {
+    convert_request_ops_inner(ops, 0)
+}
+
+fn convert_request_ops_inner(
+    ops: Vec<crate::proto::RequestOp>,
+    depth: u32,
+) -> Result<Vec<raft::RequestOp>, Status> {
     ops.into_iter()
         .map(|op| {
             let request = op.request.map(|r| match r {
-                crate::proto::request_op::Request::Put(p) => raft::Request::Put(raft::PutRequest {
-                    key: p.key,
-                    value: p.value,
-                    lease: p.lease,
-                    prev_kv: p.prev_kv,
-                }),
+                crate::proto::request_op::Request::Put(p) => {
+                    Ok(raft::Request::Put(raft::PutRequest {
+                        key: p.key,
+                        value: p.value,
+                        lease: p.lease,
+                        prev_kv: p.prev_kv,
+                    }))
+                }
                 crate::proto::request_op::Request::Get(g) => {
-                    raft::Request::Get(raft::RangeRequest {
+                    Ok(raft::Request::Get(raft::RangeRequest {
                         key: g.key,
                         range_end: g.range_end,
                         limit: g.limit,
                         revision: g.revision,
                         sort_order: raft::SortOrder::None,
                         sort_target: raft::SortTarget::Key,
-                    })
+                    }))
                 }
                 crate::proto::request_op::Request::Delete(d) => {
-                    raft::Request::Delete(raft::DeleteRequest {
+                    Ok(raft::Request::Delete(raft::DeleteRequest {
                         key: d.key,
                         range_end: d.range_end,
                         prev_kv: d.prev_kv,
-                    })
+                    }))
                 }
                 crate::proto::request_op::Request::Range(r) => {
-                    raft::Request::Range(raft::RangeRequest {
+                    Ok(raft::Request::Range(raft::RangeRequest {
                         key: r.key,
                         range_end: r.range_end,
                         limit: r.limit,
                         revision: r.revision,
                         sort_order: raft::SortOrder::None,
                         sort_target: raft::SortTarget::Key,
+                    }))
+                }
+                crate::proto::request_op::Request::Txn(t) => {
+                    if depth >= MAX_TXN_DEPTH {
+                        return Err(Status::invalid_argument(
+                            "transaction nesting depth exceeded",
+                        ));
+                    }
+                    let compare = convert_compares(t.compare);
+                    let success = convert_request_ops_inner(t.success, depth + 1)?;
+                    let failure = convert_request_ops_inner(t.failure, depth + 1)?;
+                    Ok(raft::Request::Txn(Box::new(raft::TxnRequest {
+                        compare,
+                        success,
+                        failure,
+                    })))
+                }
+            });
+            let request = match request {
+                Some(Ok(r)) => Some(r),
+                Some(Err(e)) => return Err(e),
+                None => None,
+            };
+            Ok(raft::RequestOp { request })
+        })
+        .collect()
+}
+
+fn convert_compares(compares: Vec<crate::proto::Compare>) -> Vec<raft::Compare> {
+    compares
+        .into_iter()
+        .map(|c| raft::Compare {
+            result: match c.result() {
+                crate::proto::CompareResult::Equal => raft::CompareResult::Equal,
+                crate::proto::CompareResult::Greater => raft::CompareResult::Greater,
+                crate::proto::CompareResult::Less => raft::CompareResult::Less,
+                crate::proto::CompareResult::NotEqual => raft::CompareResult::NotEqual,
+            },
+            target: match c.target() {
+                crate::proto::CompareTarget::Version => raft::CompareTarget::Version,
+                crate::proto::CompareTarget::Create => raft::CompareTarget::Create,
+                crate::proto::CompareTarget::Mod => raft::CompareTarget::Mod,
+                crate::proto::CompareTarget::Value => raft::CompareTarget::Value,
+                crate::proto::CompareTarget::Lease => raft::CompareTarget::Lease,
+            },
+            key: c.key,
+            target_union: match c.target_union {
+                Some(crate::proto::compare::TargetUnion::Version(v)) => {
+                    raft::TargetUnion::Version(v)
+                }
+                Some(crate::proto::compare::TargetUnion::CreateRevision(v)) => {
+                    raft::TargetUnion::CreateRevision(v)
+                }
+                Some(crate::proto::compare::TargetUnion::ModRevision(v)) => {
+                    raft::TargetUnion::ModRevision(v)
+                }
+                Some(crate::proto::compare::TargetUnion::Value(v)) => raft::TargetUnion::Value(v),
+                Some(crate::proto::compare::TargetUnion::Lease(v)) => raft::TargetUnion::Lease(v),
+                None => raft::TargetUnion::Version(0),
+            },
+        })
+        .collect()
+}
+
+fn convert_kv(kv: raft::KeyValue) -> KeyValue {
+    KeyValue {
+        key: kv.key,
+        value: kv.value,
+        create_revision: kv.create_revision,
+        mod_revision: kv.mod_revision,
+        version: kv.version,
+        lease: kv.lease,
+    }
+}
+
+fn convert_response_ops(responses: Vec<raft::ResponseOp>) -> Vec<crate::proto::ResponseOp> {
+    responses
+        .into_iter()
+        .map(|r| {
+            let response = r.response.map(|resp| match resp {
+                raft::Response::Put(p) => {
+                    crate::proto::response_op::Response::Put(crate::proto::PutResponse {
+                        header: None,
+                        prev_kv: p.prev_kv.map(convert_kv),
+                    })
+                }
+                raft::Response::Get(g) => {
+                    crate::proto::response_op::Response::Get(crate::proto::GetResponse {
+                        header: None,
+                        kvs: g.kvs.into_iter().map(convert_kv).collect(),
+                        count: g.count,
+                    })
+                }
+                raft::Response::Delete(d) => {
+                    crate::proto::response_op::Response::Delete(crate::proto::DeleteResponse {
+                        header: None,
+                        deleted: d.deleted,
+                        prev_kvs: d.prev_kvs.into_iter().map(convert_kv).collect(),
+                    })
+                }
+                raft::Response::Range(r) => {
+                    crate::proto::response_op::Response::Range(crate::proto::RangeResponse {
+                        header: None,
+                        kvs: r.kvs.into_iter().map(convert_kv).collect(),
+                        count: r.count,
+                    })
+                }
+                raft::Response::Txn(t) => {
+                    crate::proto::response_op::Response::Txn(crate::proto::TxnResponse {
+                        header: None,
+                        succeeded: t.succeeded,
+                        responses: convert_response_ops(t.responses),
                     })
                 }
             });
-            raft::RequestOp { request }
+            crate::proto::ResponseOp { response }
         })
         .collect()
 }

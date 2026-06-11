@@ -41,8 +41,7 @@ impl RaftRsHandle {
 #[async_trait]
 impl RaftHandle for RaftRsHandle {
     async fn propose(&self, request: RaftRequest) -> Result<RaftResponse, RaftError> {
-        let data = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&request)
-            .map(|b| b.into_vec())
+        let data = bincode::serialize(&request)
             .map_err(|e| RaftError::Internal(format!("serialize failed: {e}")))?;
 
         let (tx, rx) = oneshot::channel();
@@ -53,7 +52,7 @@ impl RaftHandle for RaftRsHandle {
 
         let resp_data = rx.await.map_err(|_| RaftError::ChannelClosed)??;
 
-        let resp = rkyv::from_bytes::<RaftResponse, rkyv::rancor::BoxedError>(&resp_data)
+        let resp = bincode::deserialize(&resp_data)
             .map_err(|e| RaftError::Internal(format!("deserialize failed: {e}")))?;
 
         if let RaftResponse::Error { message } = &resp {
