@@ -27,6 +27,8 @@ struct RaftNodeConfig {
     store: RaftRsStore,
     state_machine: Arc<Mutex<AetherStateMachine>>,
     initial_peers: Vec<(u64, String)>,
+    /// Number of committed log entries that triggers a snapshot.
+    snapshot_trigger: u64,
 }
 
 /// Channels used by the event loop to communicate with the outside world.
@@ -74,6 +76,7 @@ pub fn start_raft_node(
     state_machine: Arc<Mutex<AetherStateMachine>>,
     msg_out_tx: mpsc::Sender<Vec<Message>>,
     initial_peers: Vec<(u64, String)>,
+    snapshot_trigger: u64,
 ) -> anyhow::Result<RaftNodeHandle> {
     // Tokio channels for the RPC server and handle to send into.
     let (msg_in_tx, mut msg_in_rx) = mpsc::channel::<Message>(1024);
@@ -116,6 +119,7 @@ pub fn start_raft_node(
         store,
         state_machine,
         initial_peers,
+        snapshot_trigger,
     };
     let channels = EventLoopChannels {
         msg_in_rx: cc_msg_rx,
@@ -150,6 +154,7 @@ fn raft_event_loop(
         store,
         state_machine,
         initial_peers,
+        snapshot_trigger,
     } = node_config;
     let EventLoopChannels {
         msg_in_rx,
@@ -193,6 +198,9 @@ fn raft_event_loop(
     let mut was_leader = false;
     let tick_interval = Duration::from_millis(TICK_MS);
     let mut bootstrapped = false;
+    // Initialize from persisted snapshot index to avoid creating a redundant
+    // snapshot immediately after restart.
+    let mut last_snapshot_applied: u64 = node.store().snapshot_last_index();
 
     // Restore applied index from persistent storage so we skip entries
     // that were applied before the last shutdown.
@@ -356,7 +364,20 @@ fn raft_event_loop(
 
             let snapshot = ready.snapshot();
             if !is_empty_snapshot(snapshot) {
-                tracing::info!("received snapshot, not yet applied");
+                // Follower received a snapshot from the leader.
+                // If snapshot application fails, the node is in an inconsistent
+                // state (store updated but state machine not restored).  We MUST
+                // stop the event loop to prevent applying subsequent entries on
+                // top of stale state machine data.
+                if let Err(e) =
+                    apply_snapshot_to_state(snapshot, node.store(), &state_machine, &shared_state)
+                {
+                    tracing::error!(error = %e, "FATAL: snapshot application failed, stopping node");
+                    return;
+                }
+                // Update tracking so that if this node later becomes leader,
+                // it won't immediately create a redundant snapshot.
+                last_snapshot_applied = snapshot.get_metadata().index;
             }
 
             let committed = ready.take_committed_entries();
@@ -393,26 +414,42 @@ fn raft_event_loop(
                     shared_state
                         .applied_index
                         .store(new_applied, Ordering::Release);
-                }
 
-                // Persist ConfState for any conf change entries.
-                for entry in &to_apply {
-                    if entry.get_entry_type() == EntryType::EntryConfChange
-                        && !entry.data.is_empty()
-                        && let Ok(cc) = ConfChange::decode(entry.data.as_slice())
-                    {
-                        match node.apply_conf_change(&cc) {
-                            Ok(cs) => {
-                                if let Err(e) = node.store().save_conf_state(&cs) {
-                                    tracing::error!(error = %e, "failed to persist conf state");
+                    // Persist ConfState for any conf change entries.
+                    for entry in &to_apply {
+                        if entry.get_entry_type() == EntryType::EntryConfChange
+                            && !entry.data.is_empty()
+                            && let Ok(cc) = ConfChange::decode(entry.data.as_slice())
+                        {
+                            match node.apply_conf_change(&cc) {
+                                Ok(cs) => {
+                                    if let Err(e) = node.store().save_conf_state(&cs) {
+                                        tracing::error!(error = %e, "failed to persist conf state");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        index = entry.index,
+                                        "failed to apply conf change to raft"
+                                    );
                                 }
                             }
+                        }
+                    }
+
+                    // Leader-side snapshot trigger: create snapshot when enough
+                    // entries have been applied since the last snapshot.
+                    if snapshot_trigger > 0
+                        && node.raft.state == StateRole::Leader
+                        && new_applied - last_snapshot_applied >= snapshot_trigger
+                    {
+                        match create_leader_snapshot(node.store(), &state_machine, new_applied) {
+                            Ok(()) => last_snapshot_applied = new_applied,
                             Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    index = entry.index,
-                                    "failed to apply conf change to raft"
-                                );
+                                tracing::error!(error = %e, "failed to create snapshot");
+                                // Do NOT update last_snapshot_applied — the next
+                                // apply will retry the snapshot creation.
                             }
                         }
                     }
@@ -496,6 +533,91 @@ fn apply_entry(
             );
         }
     }
+}
+
+/// Create a snapshot on the leader: serialize state machine, persist to store,
+/// and compact old log entries.
+fn create_leader_snapshot(
+    store: &RaftRsStore,
+    state_machine: &Arc<Mutex<AetherStateMachine>>,
+    applied_index: u64,
+) -> Result<(), String> {
+    // Clone the Arc<RocksStorage> while briefly holding the lock, then release
+    // immediately.  The expensive CF iteration happens without the lock.
+    let storage = {
+        let sm = state_machine.lock().expect("state machine mutex poisoned");
+        sm.storage.clone()
+    };
+
+    let snapshot_data = AetherStateMachine::create_snapshot(&storage)?;
+
+    // Determine the term for the snapshot index.
+    let term = store.term(applied_index).unwrap_or(0);
+
+    // Get current conf state.
+    let conf_state = store
+        .initial_state()
+        .map(|s| s.conf_state)
+        .unwrap_or_default();
+
+    // Persist snapshot data to the store.
+    store
+        .save_snapshot_data(&snapshot_data, applied_index, term, &conf_state)
+        .map_err(|e| format!("save snapshot data: {e}"))?;
+
+    // Compact log entries up to and including the snapshot index.
+    // The snapshot data covers all state up to applied_index, so log entries
+    // at or below that index are redundant.
+    if applied_index > 0 {
+        let compact_index = applied_index + 1;
+        if let Err(e) = store.compact(compact_index) {
+            tracing::warn!(error = %e, compact_index, "failed to compact after snapshot");
+        }
+    }
+
+    tracing::info!(
+        index = applied_index,
+        term,
+        data_len = snapshot_data.len(),
+        "created snapshot"
+    );
+    Ok(())
+}
+
+/// Apply an incoming snapshot from the leader to the state machine and store.
+fn apply_snapshot_to_state(
+    snapshot: &raft::eraftpb::Snapshot,
+    store: &RaftRsStore,
+    state_machine: &Arc<Mutex<AetherStateMachine>>,
+    shared_state: &Arc<RaftSharedState>,
+) -> Result<(), String> {
+    let meta = snapshot.get_metadata();
+    let data = snapshot.get_data();
+    let index = meta.index;
+    let term = meta.term;
+
+    // Apply to the store (persists snapshot data, purges old log).
+    store
+        .apply_snapshot(meta, data)
+        .map_err(|e| format!("store apply_snapshot: {e}"))?;
+
+    // Restore the state machine from snapshot data.
+    if !data.is_empty() {
+        let mut sm = state_machine.lock().expect("state machine mutex poisoned");
+        sm.restore_snapshot(data, index)?;
+    }
+
+    // Update shared state so the API layer sees the new applied index.
+    shared_state.applied_index.store(index, Ordering::Release);
+    shared_state.commit_index.store(index, Ordering::Release);
+
+    // Persist applied index.
+    if let Err(e) = store.save_applied_index(index) {
+        tracing::error!(error = %e, "failed to persist applied index after snapshot");
+    }
+
+    tracing::info!(index, term, "applied snapshot from leader");
+    Ok(())
 }
 
 fn is_empty_snapshot(snap: &raft::eraftpb::Snapshot) -> bool {
