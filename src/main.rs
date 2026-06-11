@@ -5,10 +5,13 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use rand_core::{OsRng, RngCore};
 use tonic::transport::Server;
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use aether::api::health::HealthStatus;
+use aether::api::metrics::{MetricsLayer, MetricsRegistry};
 use aether::api::{AuthService, ClusterService, KvService, LeaseService, WatchService};
 use aether::auth::AuthLayer;
-use aether::config::AetherConfig;
+use aether::config::{AetherConfig, LogConfig};
 use aether::lease::{LeaseManager, LeaseStore};
 use aether::proto::aether_auth_server::AetherAuthServer;
 use aether::proto::aether_cluster_server::AetherClusterServer;
@@ -24,6 +27,68 @@ use aether::raft::state_machine::AetherStateMachine;
 use aether::raft::{RaftHandle, WatchEvent};
 use aether::storage::{RocksStorage, StorageEngine};
 use aether::watch::WatchManager;
+
+/// Admin HTTP connection timeout.
+const ADMIN_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Interval for updating lease/watch gauge metrics.
+const GAUGE_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Holds the tracing non-blocking guard alive for the process lifetime.
+/// Stored in a static so it is dropped on exit, flushing buffered log events.
+static TRACING_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
+
+fn init_tracing(config: &LogConfig) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+
+    if !config.log_dir.is_empty() {
+        // File logging: daily rotation, all levels to file, warn+ to stdout
+        let file_appender =
+            tracing_appender::rolling::daily(&config.log_dir, &config.log_file_prefix);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        if config.json {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    fmt::layer()
+                        .with_writer(non_blocking)
+                        .with_ansi(false)
+                        .json(),
+                )
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stdout)
+                        .json()
+                        .with_filter(EnvFilter::new("warn")),
+                )
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+                .with(
+                    fmt::layer()
+                        .with_writer(std::io::stdout)
+                        .with_filter(EnvFilter::new("warn")),
+                )
+                .init();
+        }
+        // Store guard in static so it lives for the process lifetime and flushes on exit.
+        let _ = TRACING_GUARD.set(guard);
+    } else if config.json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_writer(std::io::stdout).json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_writer(std::io::stdout))
+            .init();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "aether", about = "A distributed key-value store")]
@@ -49,15 +114,10 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt::init();
-
-    tracing::info!("Aether starting...");
-
-    // Load config
+    // Load config (before tracing init so we can read log settings)
     let mut config = if std::path::Path::new(&cli.config).exists() {
         AetherConfig::load(&cli.config)?
     } else {
-        tracing::info!("Config file not found, using defaults");
         AetherConfig::default()
     };
 
@@ -72,6 +132,23 @@ async fn main() -> anyhow::Result<()> {
         config.data_dir = PathBuf::from(data_dir);
     }
 
+    // Validate addresses early for clear error messages
+    config
+        .metrics
+        .listen_addr
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "invalid metrics.listen_addr '{}': {}",
+                config.metrics.listen_addr,
+                e
+            )
+        })?;
+
+    // Initialize tracing with config
+    init_tracing(&config.log);
+
+    tracing::info!("Aether starting...");
     tracing::info!(
         node_id = config.node_id,
         addr = %config.addr,
@@ -82,6 +159,11 @@ async fn main() -> anyhow::Result<()> {
     // Initialize storage (creates default, raft_log, raft_state CFs)
     let storage = Arc::new(RocksStorage::open(&config.data_dir)?);
     tracing::info!("Storage initialized");
+
+    // Create observability components
+    let metrics = Arc::new(MetricsRegistry::new());
+    let health = HealthStatus::new();
+    health.set_storage_ready(true);
 
     // Create raft-rs log store sharing the same RocksDB instance
     let raft_store = RaftRsStore::new(storage.db().clone());
@@ -254,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
         msg_out_tx,
         initial_peers.clone(),
         config.cluster.snapshot_trigger_log_entries,
+        metrics.clone(),
     )?;
 
     tracing::info!("Raft event loop started");
@@ -267,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create services
     let watch_manager = WatchManager::new(watch_tx);
+    let watch_manager_for_metrics = watch_manager.clone();
     let watch_service = WatchService::new(
         watch_manager,
         auth_enabled.clone(),
@@ -380,9 +464,46 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Lease expiry task started");
 
+    // Periodic gauge updater for lease and watch metrics
+    {
+        let gauge_metrics = metrics.clone();
+        let gauge_lease_manager = lease_manager.clone();
+        let gauge_watch_manager = watch_manager_for_metrics;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(GAUGE_UPDATE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let lease_count = gauge_lease_manager
+                    .lock()
+                    .map(|mgr| mgr.lease_count())
+                    .unwrap_or(0);
+                gauge_metrics.active_leases.set(lease_count as f64);
+                let watch_count = gauge_watch_manager.active_count().await;
+                gauge_metrics.active_watchers.set(watch_count as f64);
+            }
+        });
+    }
+
+    // Mark raft as ready (event loop is running)
+    health.set_raft_ready(true);
+
+    // Spawn admin HTTP server for /metrics and /health
+    let admin_health = health.clone();
+    let admin_metrics = metrics.clone();
+    let admin_addr: std::net::SocketAddr = config.metrics.listen_addr.parse()?;
+    tokio::spawn(async move {
+        if let Err(e) = serve_admin(admin_addr, admin_metrics, admin_health).await {
+            tracing::error!(error = %e, "admin HTTP server failed");
+        }
+    });
+    tracing::info!(addr = %config.metrics.listen_addr, "Admin HTTP server started");
+
     let auth_layer = AuthLayer::new(auth_interceptor_for_api);
+    let metrics_layer = MetricsLayer::new(metrics);
 
     Server::builder()
+        .layer(metrics_layer)
         .layer(auth_layer)
         .add_service(AetherAuthServer::new(auth_service))
         .add_service(AetherKvServer::new(kv_service))
@@ -395,4 +516,101 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Aether stopped");
     Ok(())
+}
+
+/// Runs the admin HTTP server. Returns only if bind fails; otherwise loops forever.
+async fn serve_admin(
+    addr: std::net::SocketAddr,
+    metrics: Arc<MetricsRegistry>,
+    health: HealthStatus,
+) -> anyhow::Result<()> {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(addr = %addr, "Admin HTTP server listening");
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(error = %e, "admin HTTP accept error");
+                // Back off briefly to avoid tight loop on persistent errors
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let io = TokioIo::new(stream);
+        let metrics = metrics.clone();
+        let health = health.clone();
+
+        tokio::spawn(async move {
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let metrics = metrics.clone();
+                let health = health.clone();
+                async move {
+                    if req.method() != hyper::Method::GET {
+                        return Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(405)
+                                .body(Full::new(Bytes::from("METHOD NOT ALLOWED")))
+                                .unwrap(),
+                        );
+                    }
+                    let response = match req.uri().path() {
+                        "/metrics" => {
+                            let body = metrics.gather();
+                            Response::builder()
+                                .status(200)
+                                .header("Content-Type", "text/plain; version=0.0.4")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap()
+                        }
+                        "/health/live" => Response::builder()
+                            .status(200)
+                            .body(Full::new(Bytes::from("OK")))
+                            .unwrap(),
+                        "/health/ready" => {
+                            if health.is_ready() {
+                                Response::builder()
+                                    .status(200)
+                                    .body(Full::new(Bytes::from("OK")))
+                                    .unwrap()
+                            } else {
+                                Response::builder()
+                                    .status(503)
+                                    .body(Full::new(Bytes::from("NOT READY")))
+                                    .unwrap()
+                            }
+                        }
+                        _ => Response::builder()
+                            .status(404)
+                            .body(Full::new(Bytes::from("NOT FOUND")))
+                            .unwrap(),
+                    };
+                    Ok::<_, hyper::Error>(response)
+                }
+            });
+
+            let conn_result = tokio::time::timeout(
+                ADMIN_CONN_TIMEOUT,
+                http1::Builder::new().serve_connection(io, service),
+            )
+            .await;
+            match conn_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(error = %err, "admin HTTP connection error");
+                }
+                Err(_) => {
+                    tracing::debug!("admin HTTP connection timed out");
+                }
+            }
+        });
+    }
 }

@@ -1,7 +1,9 @@
 mod auth;
 mod cluster;
+pub mod health;
 mod kv;
 mod lease;
+pub mod metrics;
 mod watch;
 
 pub use self::auth::AuthService;
