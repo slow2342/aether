@@ -12,33 +12,14 @@ pub use self::handle::{RaftError, RaftHandle, ensure_linearizable, require_leade
 pub type NodeId = u64;
 
 /// Node information for cluster membership
-#[derive(
-    Debug,
-    Clone,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RaftNode {
     pub addr: String,
     pub data: String,
 }
 
 /// Raft request types
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum RaftRequest {
     /// Put a key-value pair
     Put {
@@ -101,15 +82,7 @@ pub enum RaftRequest {
 }
 
 /// Raft response types
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum RaftResponse {
     Put {
         prev_kv: Option<KeyValue>,
@@ -152,15 +125,7 @@ pub enum RaftResponse {
 }
 
 /// Key-value pair
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeyValue {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -171,15 +136,7 @@ pub struct KeyValue {
 }
 
 /// Compare operation for transactions
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Compare {
     pub result: CompareResult,
     pub target: CompareTarget,
@@ -188,18 +145,7 @@ pub struct Compare {
 }
 
 /// Compare result
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CompareResult {
     Equal,
     Greater,
@@ -208,18 +154,7 @@ pub enum CompareResult {
 }
 
 /// Compare target
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CompareTarget {
     Version,
     Create,
@@ -229,15 +164,7 @@ pub enum CompareTarget {
 }
 
 /// Target union for compare operations
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TargetUnion {
     Version(i64),
     CreateRevision(i64),
@@ -247,46 +174,31 @@ pub enum TargetUnion {
 }
 
 /// Request operation for transactions
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestOp {
     pub request: Option<Request>,
 }
 
 /// Request types for transactions
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Request {
     Put(PutRequest),
     Get(RangeRequest),
     Delete(DeleteRequest),
     Range(RangeRequest),
+    Txn(Box<TxnRequest>),
+}
+
+/// Transaction request for nested transactions
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TxnRequest {
+    pub compare: Vec<Compare>,
+    pub success: Vec<RequestOp>,
+    pub failure: Vec<RequestOp>,
 }
 
 /// Put request
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PutRequest {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -295,15 +207,7 @@ pub struct PutRequest {
 }
 
 /// Range request
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RangeRequest {
     pub key: Vec<u8>,
     pub range_end: Vec<u8>,
@@ -314,15 +218,7 @@ pub struct RangeRequest {
 }
 
 /// Delete request
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeleteRequest {
     pub key: Vec<u8>,
     pub range_end: Vec<u8>,
@@ -330,18 +226,7 @@ pub struct DeleteRequest {
 }
 
 /// Sort order
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortOrder {
     None,
     Ascend,
@@ -349,18 +234,7 @@ pub enum SortOrder {
 }
 
 /// Sort target
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortTarget {
     Key,
     Version,
@@ -370,90 +244,50 @@ pub enum SortTarget {
 }
 
 /// Response operation for transactions
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResponseOp {
     pub response: Option<Response>,
 }
 
 /// Response types for transactions
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Response {
     Put(PutResponse),
     Get(RangeResponse),
     Delete(DeleteResponse),
     Range(RangeResponse),
+    Txn(Box<TxnResponse>),
+}
+
+/// Transaction response for nested transactions
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TxnResponse {
+    pub succeeded: bool,
+    pub responses: Vec<ResponseOp>,
 }
 
 /// Put response
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PutResponse {
     pub prev_kv: Option<KeyValue>,
 }
 
 /// Range response
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RangeResponse {
     pub kvs: Vec<KeyValue>,
     pub count: i64,
 }
 
 /// Delete response
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeleteResponse {
     pub deleted: i64,
     pub prev_kvs: Vec<KeyValue>,
 }
 
 /// Watch event for state machine notifications
-#[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WatchEvent {
     pub event_type: WatchEventType,
     pub kv: KeyValue,
@@ -461,18 +295,7 @@ pub struct WatchEvent {
 }
 
 /// Watch event type
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WatchEventType {
     Put,
     Delete,
