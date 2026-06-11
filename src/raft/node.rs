@@ -14,6 +14,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use super::handle::RaftError;
 use super::raftrs_store::RaftRsStore;
 use super::state_machine::AetherStateMachine;
+use crate::api::metrics::MetricsRegistry;
 
 /// Proposal from a client, with a oneshot channel for the response.
 pub struct ProposeRequest {
@@ -29,6 +30,7 @@ struct RaftNodeConfig {
     initial_peers: Vec<(u64, String)>,
     /// Number of committed log entries that triggers a snapshot.
     snapshot_trigger: u64,
+    metrics: Arc<MetricsRegistry>,
 }
 
 /// Channels used by the event loop to communicate with the outside world.
@@ -100,6 +102,7 @@ pub fn start_raft_node(
     msg_out_tx: mpsc::Sender<Vec<Message>>,
     initial_peers: Vec<(u64, String)>,
     snapshot_trigger: u64,
+    metrics: Arc<MetricsRegistry>,
 ) -> anyhow::Result<RaftNodeHandle> {
     // Tokio channels for the RPC server and handle to send into.
     let (msg_in_tx, mut msg_in_rx) = mpsc::channel::<Message>(1024);
@@ -152,6 +155,7 @@ pub fn start_raft_node(
         state_machine,
         initial_peers,
         snapshot_trigger,
+        metrics,
     };
     let channels = EventLoopChannels {
         msg_in_rx: cc_msg_rx,
@@ -189,6 +193,7 @@ fn raft_event_loop(
         state_machine,
         initial_peers,
         snapshot_trigger,
+        metrics,
     } = node_config;
     let EventLoopChannels {
         msg_in_rx,
@@ -352,6 +357,10 @@ fn raft_event_loop(
         // Process normal proposals.
         for prop in props {
             if node.raft.state != StateRole::Leader {
+                metrics
+                    .raft_proposals_total
+                    .with_label_values(&["not_leader"])
+                    .inc();
                 let _ = prop.tx.send(Err(RaftError::NotLeader {
                     leader: Some(node.raft.leader_id),
                 }));
@@ -368,6 +377,10 @@ fn raft_event_loop(
             data.extend_from_slice(&prop.data);
 
             if let Err(e) = node.propose(vec![], data) {
+                metrics
+                    .raft_proposals_total
+                    .with_label_values(&["fail"])
+                    .inc();
                 tracing::error!(error = %e, "propose failed");
                 if let Some(tx) = pending.remove(&id) {
                     let _ = tx.send(Err(RaftError::Internal(format!("propose failed: {e}"))));
@@ -545,6 +558,9 @@ fn raft_event_loop(
                 for (_, tx) in pending_read_index.drain() {
                     let _ = tx.send(Err(RaftError::NotLeader { leader: None }));
                 }
+            }
+            if !was_leader && is_leader {
+                metrics.raft_leader_changes_total.inc();
             }
             was_leader = is_leader;
 

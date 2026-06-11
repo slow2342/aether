@@ -23,6 +23,9 @@ pub struct AetherConfig {
 
     #[serde(default)]
     pub lease: LeaseConfig,
+
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +69,21 @@ pub struct LogConfig {
 
     #[serde(default)]
     pub json: bool,
+
+    /// Directory for log files. Empty string disables file logging.
+    #[serde(default)]
+    pub log_dir: String,
+
+    /// Log file name prefix. Files are rotated daily.
+    #[serde(default = "default_log_file_prefix")]
+    pub log_file_prefix: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Listen address for the admin HTTP server (metrics + health).
+    #[serde(default = "default_metrics_listen_addr")]
+    pub listen_addr: String,
 }
 
 fn default_node_id() -> u64 {
@@ -106,6 +124,14 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_log_file_prefix() -> String {
+    "aether".to_string()
+}
+
+fn default_metrics_listen_addr() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +158,8 @@ impl Default for LogConfig {
         Self {
             level: default_log_level(),
             json: false,
+            log_dir: String::new(),
+            log_file_prefix: default_log_file_prefix(),
         }
     }
 }
@@ -162,6 +190,14 @@ impl Default for LeaseConfig {
     }
 }
 
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_metrics_listen_addr(),
+        }
+    }
+}
+
 impl Default for AetherConfig {
     fn default() -> Self {
         Self {
@@ -172,6 +208,7 @@ impl Default for AetherConfig {
             auth: AuthConfig::default(),
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
