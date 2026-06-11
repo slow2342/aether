@@ -194,6 +194,19 @@ fn raft_event_loop(
     let tick_interval = Duration::from_millis(TICK_MS);
     let mut bootstrapped = false;
 
+    // Restore applied index from persistent storage so we skip entries
+    // that were applied before the last shutdown.
+    let persisted_applied = node.store().load_applied_index().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load applied index, starting from 0");
+        0
+    });
+    if persisted_applied > 0 {
+        shared_state
+            .applied_index
+            .store(persisted_applied, Ordering::Release);
+        tracing::info!(applied_index = persisted_applied, "restored applied index");
+    }
+
     if needs_bootstrap && initial_peers.len() == 1 && initial_peers[0].0 == config.id {
         tracing::info!(node_id = config.id, "bootstrapping single-node cluster");
         if let Err(e) = node.campaign() {
@@ -354,18 +367,36 @@ fn raft_event_loop(
                     .commit_index
                     .store(max_committed, Ordering::Release);
 
-                let mut sm = state_machine.lock().expect("state machine mutex poisoned");
-                for entry in &committed {
-                    apply_entry(&mut sm, entry, &mut pending, &mut pending_conf);
+                // Skip entries that were already applied before the last shutdown.
+                let already_applied = shared_state.applied_index.load(Ordering::Acquire);
+                let to_apply: Vec<_> = committed
+                    .into_iter()
+                    .filter(|e| e.index > already_applied)
+                    .collect();
+
+                if !to_apply.is_empty() {
+                    let new_applied = to_apply.last().map(|e| e.index).unwrap_or(0);
+                    let mut sm = state_machine.lock().expect("state machine mutex poisoned");
+                    for entry in &to_apply {
+                        apply_entry(&mut sm, entry, &mut pending, &mut pending_conf);
+                    }
+                    drop(sm);
+
+                    // Persist applied index so we don't re-apply on restart.
+                    // Update shared_state regardless of persistence result — the
+                    // entries are already applied to the state machine, so the
+                    // in-memory index must track that. On crash+restart, we fall
+                    // back to the persisted value and re-apply (idempotent).
+                    if let Err(e) = node.store().save_applied_index(new_applied) {
+                        tracing::error!(error = %e, "failed to persist applied index");
+                    }
+                    shared_state
+                        .applied_index
+                        .store(new_applied, Ordering::Release);
                 }
-                // Update applied_index after all entries are applied
-                shared_state
-                    .applied_index
-                    .store(max_committed, Ordering::Release);
-                drop(sm);
 
                 // Persist ConfState for any conf change entries.
-                for entry in &committed {
+                for entry in &to_apply {
                     if entry.get_entry_type() == EntryType::EntryConfChange
                         && !entry.data.is_empty()
                         && let Ok(cc) = ConfChange::decode(entry.data.as_slice())

@@ -59,6 +59,117 @@ pub struct AetherStateMachine {
     pub key_indexes: HashMap<Vec<u8>, KeyIndex>,
     /// MVCC: per-key current metadata (create_revision, mod_revision, version, lease)
     pub key_metas: HashMap<Vec<u8>, KeyMeta>,
+    /// In-memory key-to-lease mapping (mirrors key_lease CF).
+    /// Tracks the lease_id for each key so that Txn sub-operations can look up
+    /// the current lease association without reading uncommitted batch writes.
+    pub key_leases: HashMap<Vec<u8>, i64>,
+}
+
+/// Captures pre-mutation in-memory state for keys touched during an apply.
+///
+/// Before `batch_put`/`batch_delete` modify `key_indexes`, `key_metas`, or
+/// `key_leases`, they call [`TxnSnapshot::record_key`] to save the original
+/// values.  After `db.write(batch)` the caller either:
+/// - calls [`commit`](TxnSnapshot::commit) on success (drops the saved state), or
+/// - calls [`rollback`](TxnSnapshot::rollback) on failure (restores every saved
+///   key to its pre-mutation value and reverses lease attach/detach operations).
+struct TxnSnapshot {
+    ki: HashMap<Vec<u8>, Option<KeyIndex>>,
+    meta: HashMap<Vec<u8>, Option<KeyMeta>>,
+    /// Per-key initial lease state (before any mutation).
+    /// `Some(lease_id)` = key was attached to that lease; `None` = no lease.
+    lease: HashMap<Vec<u8>, Option<i64>>,
+}
+
+impl TxnSnapshot {
+    fn new() -> Self {
+        Self {
+            ki: HashMap::new(),
+            meta: HashMap::new(),
+            lease: HashMap::new(),
+        }
+    }
+
+    /// Save the pre-mutation state of `key` (only once per key).
+    fn record_key(
+        &mut self,
+        key: &[u8],
+        key_indexes: &HashMap<Vec<u8>, KeyIndex>,
+        key_metas: &HashMap<Vec<u8>, KeyMeta>,
+        key_leases: &HashMap<Vec<u8>, i64>,
+    ) {
+        if !self.ki.contains_key(key) {
+            self.ki.insert(key.to_vec(), key_indexes.get(key).cloned());
+            self.meta.insert(key.to_vec(), key_metas.get(key).cloned());
+            self.lease
+                .insert(key.to_vec(), key_leases.get(key).copied());
+        }
+    }
+
+    /// Discard saved state — batch write succeeded.
+    fn commit(self) {
+        // Drop self — nothing to restore.
+    }
+
+    /// Restore every saved key to its pre-mutation state and reconcile
+    /// lease_manager to match the saved per-key lease state.
+    /// Called when `db.write(batch)` fails.
+    fn rollback(self, sm: &mut AetherStateMachine) {
+        // Restore key_metas, key_indexes, key_leases first.
+        for (key, old) in &self.meta {
+            match old {
+                Some(m) => {
+                    sm.key_metas.insert(key.clone(), m.clone());
+                }
+                None => {
+                    sm.key_metas.remove(key);
+                }
+            }
+        }
+        for (key, old) in &self.ki {
+            match old {
+                Some(ki) => {
+                    sm.key_indexes.insert(key.clone(), ki.clone());
+                }
+                None => {
+                    sm.key_indexes.remove(key);
+                }
+            }
+        }
+        for (key, old) in &self.lease {
+            match old {
+                Some(id) => {
+                    sm.key_leases.insert(key.clone(), *id);
+                }
+                None => {
+                    sm.key_leases.remove(key);
+                }
+            }
+        }
+
+        // Reconcile lease_manager: for each touched key, ensure the lease
+        // attachment matches the saved initial state.
+        let mut mgr = sm.lease_manager.lock().unwrap();
+        for (key, initial_lease) in &self.lease {
+            let current_lease = sm.key_leases.get(key).copied();
+            match (*initial_lease, current_lease) {
+                (Some(init_id), Some(cur_id)) if init_id != cur_id => {
+                    // Lease changed: detach current, attach initial.
+                    mgr.detach_key(cur_id, key);
+                    mgr.attach_key(init_id, key.clone());
+                }
+                (None, Some(cur_id)) => {
+                    // Had no lease, now has one: detach.
+                    mgr.detach_key(cur_id, key);
+                }
+                (Some(init_id), None) => {
+                    // Had lease, now has none: re-attach.
+                    mgr.attach_key(init_id, key.clone());
+                }
+                _ => {} // No change needed.
+            }
+        }
+    }
 }
 
 impl AetherStateMachine {
@@ -73,6 +184,7 @@ impl AetherStateMachine {
         let key_indexes = load_key_indexes(storage.db(), storage.mvcc_cf())
             .expect("failed to load key indexes from mvcc CF");
         let key_metas = Self::load_key_metas_from_indexes(&storage, &key_indexes);
+        let key_leases = Self::load_key_leases_from_meta(&key_metas);
         Self {
             last_applied: 0,
             storage,
@@ -83,6 +195,7 @@ impl AetherStateMachine {
             auth_enabled,
             key_indexes,
             key_metas,
+            key_leases,
         }
     }
 
@@ -114,6 +227,15 @@ impl AetherStateMachine {
         metas
     }
 
+    /// Build key_leases map from key_metas (lease field in metadata).
+    fn load_key_leases_from_meta(key_metas: &HashMap<Vec<u8>, KeyMeta>) -> HashMap<Vec<u8>, i64> {
+        key_metas
+            .iter()
+            .filter(|(_, m)| m.lease > 0)
+            .map(|(k, m)| (k.clone(), m.lease))
+            .collect()
+    }
+
     fn storage_get(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.storage.get(key) {
             Ok(val) => val,
@@ -122,6 +244,268 @@ impl AetherStateMachine {
                 None
             }
         }
+    }
+
+    /// Append a Put operation to `batch` and update in-memory state.
+    /// Does NOT call `db.write()` — the caller is responsible for committing
+    /// (and calling `snapshot.commit()`) or rolling back (`snapshot.rollback()`).
+    ///
+    /// `snapshot` records the pre-mutation state of each touched key so that
+    /// `rollback()` can restore the exact prior state if the batch write fails.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_put(
+        &mut self,
+        batch: &mut WriteBatch,
+        snapshot: &mut TxnSnapshot,
+        value_cache: &mut HashMap<Vec<u8>, Vec<u8>>,
+        key: Vec<u8>,
+        value: &[u8],
+        lease_id: i64,
+        revision: u64,
+    ) -> Result<Option<KeyValue>, String> {
+        // Read existing metadata for prev_kv response.
+        // Use value_cache for the value if available (same-batch prior write),
+        // otherwise fall back to RocksDB.
+        let cached_value = value_cache.get(&key).cloned();
+        let prev_value = cached_value.or_else(|| self.storage_get(&key));
+        let prev_kv = self
+            .key_metas
+            .get(&key)
+            .map(|m| m.to_kv(key.clone(), prev_value.unwrap_or_default()));
+
+        // Snapshot the key before any mutation.
+        snapshot.record_key(&key, &self.key_indexes, &self.key_metas, &self.key_leases);
+
+        // Compute new MVCC metadata.
+        let rev = revision as i64;
+        let (create_rev, ver) = match self.key_metas.get(&key) {
+            Some(old) => (old.create_revision, old.version + 1),
+            None => (rev, 1),
+        };
+        let new_meta = KeyMeta {
+            create_revision: create_rev,
+            mod_revision: rev,
+            version: ver,
+            lease: lease_id,
+        };
+
+        // Serialize MVCC value.
+        let mvcc_val = MvccValue {
+            create_revision: new_meta.create_revision,
+            mod_revision: new_meta.mod_revision,
+            version: new_meta.version,
+            lease: new_meta.lease,
+            value: value.to_vec(),
+        };
+        let mvcc_val_bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&mvcc_val)
+            .map_err(|e| format!("serialize failed: {e}"))?;
+        let mvcc_key = encode_mvcc_key(&key, revision);
+
+        // Prepare key_index mutation on a clone.
+        let mut new_ki = self.key_indexes.get(&key).cloned().unwrap_or_default();
+        new_ki.put(revision);
+
+        // Look up old lease from in-memory state (accurate within a multi-op Txn).
+        let old_lease_id = self.key_leases.get(&key).copied();
+
+        // Add writes to the shared batch.
+        batch.put_cf(self.storage.default_cf(), &key, value);
+        batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, mvcc_val_bytes.as_ref());
+
+        // Handle lease association changes.
+        if lease_id > 0 {
+            self.lease_store
+                .batch_put_lease_association(&key, lease_id, old_lease_id, batch);
+        } else if let Some(old_id) = old_lease_id
+            && old_id > 0
+        {
+            // Clear old lease association when new lease_id is 0.
+            batch.delete_cf(self.storage.key_lease_cf(), &key);
+            let mut lk_key = Vec::with_capacity(8 + key.len());
+            lk_key.extend_from_slice(&old_id.to_be_bytes());
+            lk_key.extend_from_slice(&key);
+            batch.delete_cf(self.storage.lease_keys_cf(), lk_key);
+        }
+
+        // Update in-memory state immediately so subsequent ops see the change.
+        // These changes will be rolled back by snapshot.rollback() if the batch
+        // write fails.
+        self.key_indexes.insert(key.clone(), new_ki);
+        self.key_metas.insert(key.clone(), new_meta);
+        value_cache.insert(key.clone(), value.to_vec());
+        if lease_id > 0 {
+            self.key_leases.insert(key.clone(), lease_id);
+        } else {
+            self.key_leases.remove(&key);
+        }
+
+        if lease_id > 0 {
+            let mut mgr = self.lease_manager.lock().unwrap();
+            if let Some(old_id) = old_lease_id
+                && old_id != lease_id
+                && old_id > 0
+            {
+                mgr.detach_key(old_id, &key);
+            }
+            mgr.attach_key(lease_id, key.clone());
+        } else if let Some(old_id) = old_lease_id
+            && old_id > 0
+        {
+            self.lease_manager.lock().unwrap().detach_key(old_id, &key);
+        }
+
+        Ok(prev_kv)
+    }
+
+    /// Append a Delete operation to `batch` and update in-memory state.
+    /// Returns (deleted_count, prev_kvs, watch_events).
+    fn batch_delete(
+        &mut self,
+        batch: &mut WriteBatch,
+        snapshot: &mut TxnSnapshot,
+        value_cache: &mut HashMap<Vec<u8>, Vec<u8>>,
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        revision: u64,
+    ) -> Result<(i64, Vec<KeyValue>, Vec<WatchEvent>), String> {
+        let mut deleted = 0i64;
+        let mut prev_kvs = Vec::new();
+        let mut watch_events = Vec::new();
+
+        if range_end.is_empty() {
+            // Single key delete.
+            if self.key_metas.contains_key(&key) {
+                snapshot.record_key(&key, &self.key_indexes, &self.key_metas, &self.key_leases);
+
+                let meta = self.key_metas.get(&key).unwrap().clone();
+                let value = value_cache
+                    .remove(&key)
+                    .or_else(|| self.storage_get(&key))
+                    .unwrap_or_default();
+                let prev_kv = meta.to_kv(key.clone(), value);
+
+                let mut new_ki = self.key_indexes.get(&key).cloned().unwrap_or_default();
+                new_ki.tombstone(revision);
+
+                // Clean up lease associations.
+                let detach_ops: Vec<(i64, Vec<u8>)> = match self.key_leases.get(&key) {
+                    Some(&lid) if lid > 0 => {
+                        batch.delete_cf(self.storage.key_lease_cf(), &key);
+                        let mut lk_key = Vec::with_capacity(8 + key.len());
+                        lk_key.extend_from_slice(&lid.to_be_bytes());
+                        lk_key.extend_from_slice(&key);
+                        batch.delete_cf(self.storage.lease_keys_cf(), lk_key);
+                        vec![(lid, key.clone())]
+                    }
+                    _ => Vec::new(),
+                };
+
+                batch.delete_cf(self.storage.default_cf(), &key);
+
+                // Write MVCC tombstone.
+                let mvcc_key = encode_mvcc_key(&key, revision);
+                batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
+
+                // Update in-memory state.
+                self.key_indexes.insert(key.clone(), new_ki);
+                self.key_metas.remove(&key);
+                self.key_leases.remove(&key);
+                {
+                    let mut mgr = self.lease_manager.lock().unwrap();
+                    for (lease_id, k) in &detach_ops {
+                        mgr.detach_key(*lease_id, k);
+                    }
+                }
+
+                deleted = 1;
+                watch_events.push(WatchEvent {
+                    event_type: super::WatchEventType::Delete,
+                    kv: prev_kv.clone(),
+                    prev_kv: None,
+                });
+                prev_kvs.push(prev_kv);
+            }
+        } else {
+            // Range delete.
+            let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+            let mut prevs: Vec<KeyValue> = Vec::new();
+
+            for (k, meta) in &self.key_metas {
+                if k.as_slice() >= key.as_slice()
+                    && (range_end == b"\0" || k.as_slice() < range_end.as_slice())
+                {
+                    let value = value_cache
+                        .remove(k)
+                        .or_else(|| self.storage_get(k))
+                        .unwrap_or_default();
+                    prevs.push(meta.to_kv(k.clone(), value));
+                    keys_to_delete.push(k.clone());
+                }
+            }
+            keys_to_delete.sort();
+
+            if !keys_to_delete.is_empty() {
+                for k in &keys_to_delete {
+                    snapshot.record_key(k, &self.key_indexes, &self.key_metas, &self.key_leases);
+                }
+
+                // Prepare key_index mutations on clones.
+                let mut ki_mutations: Vec<(Vec<u8>, KeyIndex)> = Vec::new();
+                for k in &keys_to_delete {
+                    let mut new_ki = self.key_indexes.get(k).cloned().unwrap_or_default();
+                    new_ki.tombstone(revision);
+                    ki_mutations.push((k.clone(), new_ki));
+                }
+
+                // Clean up lease associations.
+                let mut detach_ops: Vec<(i64, Vec<u8>)> = Vec::new();
+                for k in &keys_to_delete {
+                    if let Some(&lid) = self.key_leases.get(k)
+                        && lid > 0
+                    {
+                        batch.delete_cf(self.storage.key_lease_cf(), k);
+                        let mut lk_key = Vec::with_capacity(8 + k.len());
+                        lk_key.extend_from_slice(&lid.to_be_bytes());
+                        lk_key.extend_from_slice(k);
+                        batch.delete_cf(self.storage.lease_keys_cf(), lk_key);
+                        detach_ops.push((lid, k.clone()));
+                    }
+                }
+
+                for k in &keys_to_delete {
+                    batch.delete_cf(self.storage.default_cf(), k);
+                    let mvcc_key = encode_mvcc_key(k, revision);
+                    batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
+                }
+
+                // Update in-memory state.
+                for (k, ki) in ki_mutations {
+                    self.key_indexes.insert(k, ki);
+                }
+                for k in &keys_to_delete {
+                    self.key_metas.remove(k);
+                    self.key_leases.remove(k);
+                }
+                {
+                    let mut mgr = self.lease_manager.lock().unwrap();
+                    for (lease_id, k) in &detach_ops {
+                        mgr.detach_key(*lease_id, k);
+                    }
+                }
+
+                deleted = keys_to_delete.len() as i64;
+                for kv in &prevs {
+                    watch_events.push(WatchEvent {
+                        event_type: super::WatchEventType::Delete,
+                        kv: kv.clone(),
+                        prev_kv: None,
+                    });
+                }
+                prev_kvs = prevs;
+            }
+        }
+
+        Ok((deleted, prev_kvs, watch_events))
     }
 
     /// Apply a request to the state machine.
@@ -133,220 +517,75 @@ impl AetherStateMachine {
                 value,
                 lease_id,
             } => {
-                // Read existing metadata for prev_kv response.
-                let prev_kv = self
-                    .key_metas
-                    .get(&key)
-                    .map(|m| m.to_kv(key.clone(), self.storage_get(&key).unwrap_or_default()));
-
-                // Compute new MVCC metadata.
-                let rev = revision as i64;
-                let (create_rev, ver) = match self.key_metas.get(&key) {
-                    Some(old) => (old.create_revision, old.version + 1),
-                    None => (rev, 1),
-                };
-                let new_meta = KeyMeta {
-                    create_revision: create_rev,
-                    mod_revision: rev,
-                    version: ver,
-                    lease: lease_id,
-                };
-
-                // Write MVCC versioned entry + default CF atomically.
-                let mvcc_val = MvccValue {
-                    create_revision: new_meta.create_revision,
-                    mod_revision: new_meta.mod_revision,
-                    version: new_meta.version,
-                    lease: new_meta.lease,
-                    value: value.clone(),
-                };
-                let mvcc_val_bytes = match rkyv::to_bytes::<rkyv::rancor::BoxedError>(&mvcc_val) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to serialize mvcc value");
-                        return RaftResponse::Error {
-                            message: format!("serialize failed: {e}"),
-                        };
+                let mut batch = WriteBatch::default();
+                let mut snapshot = TxnSnapshot::new();
+                let mut value_cache = HashMap::new();
+                let prev_kv = match self.batch_put(
+                    &mut batch,
+                    &mut snapshot,
+                    &mut value_cache,
+                    key.clone(),
+                    &value,
+                    lease_id,
+                    revision,
+                ) {
+                    Ok(p) => p,
+                    Err(message) => {
+                        snapshot.rollback(self);
+                        return RaftResponse::Error { message };
                     }
                 };
-                let mvcc_key = encode_mvcc_key(&key, revision);
-
-                // Prepare key_index mutation on a clone to avoid corrupting
-                // in-memory state if the WriteBatch fails.
-                let mut new_ki = self.key_indexes.get(&key).cloned().unwrap_or_default();
-                new_ki.put(revision);
-
-                let mut batch = WriteBatch::default();
-                batch.put_cf(self.storage.default_cf(), &key, &value);
-                batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, mvcc_val_bytes.as_ref());
                 save_global_revision(&mut batch, self.storage.meta_cf(), revision);
-
-                let old_lease_id = if lease_id > 0 {
-                    let old = self.lease_store.get_key_lease_id(&key).ok().flatten();
-                    self.lease_store
-                        .batch_put_lease_association(&key, lease_id, old, &mut batch);
-                    old
-                } else {
-                    None
-                };
-
                 if let Err(e) = self.storage.db().write(batch) {
                     tracing::error!(error = %e, "failed to put to storage");
+                    snapshot.rollback(self);
                     return RaftResponse::Error {
                         message: format!("put failed: {e}"),
                     };
                 }
-
-                // Update in-memory state after successful persistence.
-                self.key_indexes.insert(key.clone(), new_ki);
-                self.key_metas.insert(key.clone(), new_meta);
-
-                if lease_id > 0 {
-                    let mut mgr = self.lease_manager.lock().unwrap();
-                    if let Some(old_id) = old_lease_id
-                        && old_id != lease_id
-                        && old_id > 0
-                    {
-                        mgr.detach_key(old_id, &key);
-                    }
-                    mgr.attach_key(lease_id, key.clone());
-                }
-
-                let kv = self.key_metas.get(&key).unwrap().to_kv(key.clone(), value);
+                snapshot.commit();
+                let kv = self
+                    .key_metas
+                    .get(&key)
+                    .unwrap()
+                    .to_kv(key.clone(), self.storage_get(&key).unwrap_or_default());
                 let _ = self.watch_tx.send(WatchEvent {
                     event_type: super::WatchEventType::Put,
-                    kv: kv.clone(),
+                    kv,
                     prev_kv: prev_kv.clone(),
                 });
-
                 RaftResponse::Put { prev_kv }
             }
             RaftRequest::Delete { key, range_end } => {
-                let deleted;
-                let prev_kvs;
-
-                if range_end.is_empty() {
-                    // Single key delete.
-                    if self.key_metas.contains_key(&key) {
-                        let meta = self.key_metas.get(&key).unwrap().clone();
-                        let value = self.storage_get(&key).unwrap_or_default();
-                        let prev_kv = meta.to_kv(key.clone(), value);
-
-                        // Prepare key_index mutation on a clone.
-                        let mut new_ki = self.key_indexes.get(&key).cloned().unwrap_or_default();
-                        new_ki.tombstone(revision);
-
-                        let mut batch = WriteBatch::default();
-                        let detach_ops = self
-                            .lease_store
-                            .batch_lease_cleanup(std::slice::from_ref(&key), &mut batch)
-                            .unwrap_or_default();
-                        batch.delete_cf(self.storage.default_cf(), &key);
-
-                        // Write MVCC tombstone.
-                        let mvcc_key = encode_mvcc_key(&key, revision);
-                        batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
-                        save_global_revision(&mut batch, self.storage.meta_cf(), revision);
-
-                        if let Err(e) = self.storage.db().write(batch) {
-                            tracing::error!(error = %e, "failed to delete from storage");
-                            return RaftResponse::Error {
-                                message: format!("delete failed: {e}"),
-                            };
-                        }
-
-                        // Update in-memory state after successful persistence.
-                        self.key_indexes.insert(key.clone(), new_ki);
-                        self.key_metas.remove(&key);
-                        {
-                            let mut mgr = self.lease_manager.lock().unwrap();
-                            for (lease_id, k) in &detach_ops {
-                                mgr.detach_key(*lease_id, k);
-                            }
-                        }
-                        deleted = 1;
-                        prev_kvs = vec![prev_kv];
-                    } else {
-                        deleted = 0;
-                        prev_kvs = vec![];
+                let mut batch = WriteBatch::default();
+                let mut snapshot = TxnSnapshot::new();
+                let mut value_cache = HashMap::new();
+                let (deleted, prev_kvs, watch_events) = match self.batch_delete(
+                    &mut batch,
+                    &mut snapshot,
+                    &mut value_cache,
+                    key,
+                    range_end,
+                    revision,
+                ) {
+                    Ok(r) => r,
+                    Err(message) => {
+                        snapshot.rollback(self);
+                        return RaftResponse::Error { message };
                     }
-                } else {
-                    // Range delete.
-                    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
-                    let mut prevs: Vec<KeyValue> = Vec::new();
-
-                    // Collect keys that exist in key_metas within the range.
-                    for (k, meta) in &self.key_metas {
-                        if k.as_slice() >= key.as_slice()
-                            && (range_end == b"\0" || k.as_slice() < range_end.as_slice())
-                        {
-                            let value = self.storage_get(k).unwrap_or_default();
-                            prevs.push(meta.to_kv(k.clone(), value));
-                            keys_to_delete.push(k.clone());
-                        }
-                    }
-                    keys_to_delete.sort();
-
-                    if keys_to_delete.is_empty() {
-                        deleted = 0;
-                        prev_kvs = vec![];
-                    } else {
-                        // Prepare key_index mutations on clones.
-                        let mut ki_mutations: Vec<(Vec<u8>, KeyIndex)> = Vec::new();
-                        for k in &keys_to_delete {
-                            let mut new_ki = self.key_indexes.get(k).cloned().unwrap_or_default();
-                            new_ki.tombstone(revision);
-                            ki_mutations.push((k.clone(), new_ki));
-                        }
-
-                        let mut batch = WriteBatch::default();
-                        let detach_ops = self
-                            .lease_store
-                            .batch_lease_cleanup(&keys_to_delete, &mut batch)
-                            .unwrap_or_default();
-
-                        for k in &keys_to_delete {
-                            batch.delete_cf(self.storage.default_cf(), k);
-
-                            // Write MVCC tombstone.
-                            let mvcc_key = encode_mvcc_key(k, revision);
-                            batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
-                        }
-                        save_global_revision(&mut batch, self.storage.meta_cf(), revision);
-
-                        if let Err(e) = self.storage.db().write(batch) {
-                            tracing::error!(error = %e, "failed to batch delete from storage");
-                            return RaftResponse::Error {
-                                message: format!("batch delete failed: {e}"),
-                            };
-                        }
-
-                        // Update in-memory state after successful persistence.
-                        for (k, ki) in ki_mutations {
-                            self.key_indexes.insert(k, ki);
-                        }
-                        for k in &keys_to_delete {
-                            self.key_metas.remove(k);
-                        }
-                        {
-                            let mut mgr = self.lease_manager.lock().unwrap();
-                            for (lease_id, k) in &detach_ops {
-                                mgr.detach_key(*lease_id, k);
-                            }
-                        }
-                        deleted = keys_to_delete.len() as i64;
-                        prev_kvs = prevs;
-                    }
+                };
+                save_global_revision(&mut batch, self.storage.meta_cf(), revision);
+                if let Err(e) = self.storage.db().write(batch) {
+                    tracing::error!(error = %e, "failed to delete from storage");
+                    snapshot.rollback(self);
+                    return RaftResponse::Error {
+                        message: format!("delete failed: {e}"),
+                    };
                 }
-
-                for kv in &prev_kvs {
-                    let _ = self.watch_tx.send(WatchEvent {
-                        event_type: super::WatchEventType::Delete,
-                        kv: kv.clone(),
-                        prev_kv: None,
-                    });
+                snapshot.commit();
+                for event in watch_events {
+                    let _ = self.watch_tx.send(event);
                 }
-
                 RaftResponse::Delete { deleted, prev_kvs }
             }
             RaftRequest::Txn {
@@ -397,6 +636,12 @@ impl AetherStateMachine {
                     }
                 });
 
+                // All sub-operations share a single WriteBatch for atomicity.
+                let mut batch = WriteBatch::default();
+                let mut snapshot = TxnSnapshot::new();
+                let mut value_cache = HashMap::new();
+                let mut watch_events = Vec::new();
+
                 let ops = if succeeded { &success } else { &failure };
                 let mut responses = Vec::new();
 
@@ -404,42 +649,54 @@ impl AetherStateMachine {
                     if let Some(request) = &op.request {
                         let response = match request {
                             super::Request::Put(put) => {
-                                let raft_req = RaftRequest::Put {
-                                    key: put.key.clone(),
-                                    value: put.value.clone(),
-                                    lease_id: put.lease,
-                                };
-                                match self.apply_request(raft_req, revision) {
-                                    RaftResponse::Put { prev_kv } => {
-                                        super::Response::Put(super::PutResponse { prev_kv })
-                                    }
-                                    RaftResponse::Error { message } => {
+                                let prev_kv = match self.batch_put(
+                                    &mut batch,
+                                    &mut snapshot,
+                                    &mut value_cache,
+                                    put.key.clone(),
+                                    &put.value,
+                                    put.lease,
+                                    revision,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(message) => {
+                                        snapshot.rollback(self);
                                         return RaftResponse::Error {
                                             message: format!("txn put failed: {message}"),
                                         };
                                     }
-                                    _ => continue,
-                                }
+                                };
+                                let kv = self
+                                    .key_metas
+                                    .get(&put.key)
+                                    .unwrap()
+                                    .to_kv(put.key.clone(), put.value.clone());
+                                watch_events.push(WatchEvent {
+                                    event_type: super::WatchEventType::Put,
+                                    kv,
+                                    prev_kv: prev_kv.clone(),
+                                });
+                                super::Response::Put(super::PutResponse { prev_kv })
                             }
                             super::Request::Delete(del) => {
-                                let raft_req = RaftRequest::Delete {
-                                    key: del.key.clone(),
-                                    range_end: del.range_end.clone(),
-                                };
-                                match self.apply_request(raft_req, revision) {
-                                    RaftResponse::Delete { deleted, prev_kvs } => {
-                                        super::Response::Delete(super::DeleteResponse {
-                                            deleted,
-                                            prev_kvs,
-                                        })
-                                    }
-                                    RaftResponse::Error { message } => {
+                                let (deleted, prev_kvs, events) = match self.batch_delete(
+                                    &mut batch,
+                                    &mut snapshot,
+                                    &mut value_cache,
+                                    del.key.clone(),
+                                    del.range_end.clone(),
+                                    revision,
+                                ) {
+                                    Ok(r) => r,
+                                    Err(message) => {
+                                        snapshot.rollback(self);
                                         return RaftResponse::Error {
                                             message: format!("txn delete failed: {message}"),
                                         };
                                     }
-                                    _ => continue,
-                                }
+                                };
+                                watch_events.extend(events);
+                                super::Response::Delete(super::DeleteResponse { deleted, prev_kvs })
                             }
                             super::Request::Get(get) => {
                                 let kvs = if get.range_end.is_empty() {
@@ -500,6 +757,24 @@ impl AetherStateMachine {
                             response: Some(response),
                         });
                     }
+                }
+
+                // Write global revision once for the entire Txn.
+                save_global_revision(&mut batch, self.storage.meta_cf(), revision);
+
+                // Atomically commit all sub-operations in a single write.
+                if let Err(e) = self.storage.db().write(batch) {
+                    tracing::error!(error = %e, "txn: failed to commit batch write");
+                    snapshot.rollback(self);
+                    return RaftResponse::Error {
+                        message: format!("txn commit failed: {e}"),
+                    };
+                }
+                snapshot.commit();
+
+                // Emit watch events after successful commit.
+                for event in watch_events {
+                    let _ = self.watch_tx.send(event);
                 }
 
                 RaftResponse::Txn {
@@ -1551,5 +1826,161 @@ mod tests {
 
         assert_eq!(storage.get(b"k").unwrap(), None);
         assert!(sm.lease_manager.lock().unwrap().get(1).is_none());
+    }
+
+    #[test]
+    fn test_txn_multi_put_atomic() {
+        let (_dir, storage, mut sm) = setup();
+
+        // Txn that puts two keys — both should appear atomically.
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![],
+                success: vec![
+                    raft::RequestOp {
+                        request: Some(raft::Request::Put(raft::PutRequest {
+                            key: b"k1".to_vec(),
+                            value: b"v1".to_vec(),
+                            lease: 0,
+                            prev_kv: false,
+                        })),
+                    },
+                    raft::RequestOp {
+                        request: Some(raft::Request::Put(raft::PutRequest {
+                            key: b"k2".to_vec(),
+                            value: b"v2".to_vec(),
+                            lease: 0,
+                            prev_kv: false,
+                        })),
+                    },
+                ],
+                failure: vec![],
+            },
+            1,
+        );
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(succeeded);
+                assert_eq!(responses.len(), 2);
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+
+        // Both keys should be visible at the same revision.
+        assert_eq!(storage.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(storage.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(sm.key_metas.get(b"k1".as_slice()).unwrap().mod_revision, 1);
+        assert_eq!(sm.key_metas.get(b"k2".as_slice()).unwrap().mod_revision, 1);
+    }
+
+    #[test]
+    fn test_txn_put_delete_atomic() {
+        let (_dir, storage, mut sm) = setup();
+
+        // Pre-populate a key.
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k1".to_vec(),
+                value: b"old".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+
+        // Txn: overwrite k1 and delete k1 — both at the same revision.
+        let resp = sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![],
+                success: vec![
+                    raft::RequestOp {
+                        request: Some(raft::Request::Put(raft::PutRequest {
+                            key: b"k1".to_vec(),
+                            value: b"new".to_vec(),
+                            lease: 0,
+                            prev_kv: false,
+                        })),
+                    },
+                    raft::RequestOp {
+                        request: Some(raft::Request::Delete(raft::DeleteRequest {
+                            key: b"k1".to_vec(),
+                            range_end: vec![],
+                            prev_kv: false,
+                        })),
+                    },
+                ],
+                failure: vec![],
+            },
+            2,
+        );
+        match resp {
+            RaftResponse::Txn {
+                succeeded,
+                responses,
+            } => {
+                assert!(succeeded);
+                assert_eq!(responses.len(), 2);
+            }
+            other => panic!("expected Txn, got: {other:?}"),
+        }
+
+        // k1 should be deleted (the delete came after the put in the same batch).
+        assert_eq!(storage.get(b"k1").unwrap(), None);
+        assert!(!sm.key_metas.contains_key(b"k1".as_slice()));
+    }
+
+    #[test]
+    fn test_txn_watch_events_emitted() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(RocksStorage::open(dir.path()).unwrap());
+        let lease_store = LeaseStore::new(storage.clone());
+        let (lease_manager, _expiry_rx) = LeaseManager::new(10000, 1);
+        let lease_manager = Arc::new(Mutex::new(lease_manager));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let auth_cache = Arc::new(AuthCache::new());
+        let auth_enabled = Arc::new(AtomicBool::new(false));
+        let mut sm = AetherStateMachine::new(
+            tx,
+            storage,
+            lease_manager,
+            lease_store,
+            auth_cache,
+            auth_enabled,
+        );
+
+        sm.apply_request(
+            RaftRequest::Txn {
+                compare: vec![],
+                success: vec![
+                    raft::RequestOp {
+                        request: Some(raft::Request::Put(raft::PutRequest {
+                            key: b"k1".to_vec(),
+                            value: b"v1".to_vec(),
+                            lease: 0,
+                            prev_kv: false,
+                        })),
+                    },
+                    raft::RequestOp {
+                        request: Some(raft::Request::Put(raft::PutRequest {
+                            key: b"k2".to_vec(),
+                            value: b"v2".to_vec(),
+                            lease: 0,
+                            prev_kv: false,
+                        })),
+                    },
+                ],
+                failure: vec![],
+            },
+            1,
+        );
+
+        // Should receive two watch events.
+        let ev1 = rx.try_recv().unwrap();
+        assert_eq!(ev1.event_type, WatchEventType::Put);
+        let ev2 = rx.try_recv().unwrap();
+        assert_eq!(ev2.event_type, WatchEventType::Put);
+        assert!(rx.try_recv().is_err());
     }
 }
