@@ -430,7 +430,7 @@ fn apply_entry(
                     .expect("entry data length already checked"),
             );
 
-            let resp = sm.apply_normal_entry(&entry.data[8..]);
+            let resp = sm.apply_normal_entry(&entry.data[8..], entry.index);
 
             if let Some(tx) = pending.remove(&request_id) {
                 let _ = tx.send(resp.map_err(RaftError::Internal));

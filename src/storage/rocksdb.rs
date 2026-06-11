@@ -15,6 +15,7 @@ const COLUMN_FAMILIES: &[&str] = &[
     "lease",
     "lease_keys",
     "key_lease",
+    "mvcc",
 ];
 
 /// RocksDB storage engine implementation
@@ -67,14 +68,27 @@ impl RocksStorage {
         self.db.cf_handle("default").expect("default CF not found")
     }
 
-    /// Clear all user data from the default column family.
+    pub fn mvcc_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle("mvcc").expect("mvcc CF not found")
+    }
+
+    pub fn meta_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle("meta").expect("meta CF not found")
+    }
+
+    /// Clear all user data from the default and mvcc column families.
     /// Used during snapshot restore to remove stale keys not in the snapshot.
     pub fn clear_default_cf(&self) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
-        let iter = self.db.iterator(IteratorMode::Start);
+        let iter = self.db.iterator_cf(self.default_cf(), IteratorMode::Start);
         for item in iter {
             let (key, _) = item.map_err(StorageError::RocksDb)?;
-            batch.delete(key);
+            batch.delete_cf(self.default_cf(), &key);
+        }
+        let iter = self.db.iterator_cf(self.mvcc_cf(), IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item.map_err(StorageError::RocksDb)?;
+            batch.delete_cf(self.mvcc_cf(), &key);
         }
         self.db.write(batch).map_err(StorageError::RocksDb)?;
         Ok(())

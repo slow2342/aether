@@ -1,3 +1,4 @@
+pub mod mvcc;
 pub mod rocksdb;
 
 pub use self::rocksdb::RocksStorage;
