@@ -9,7 +9,7 @@ use prost011::Message as ProstMessage;
 use raft::eraftpb::{ConfChange, ConfChangeType, Entry, EntryType, Message};
 use raft::storage::Storage;
 use raft::{RawNode, StateRole};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::handle::RaftError;
 use super::raftrs_store::RaftRsStore;
@@ -36,6 +36,7 @@ struct EventLoopChannels {
     msg_in_rx: CcReceiver<Message>,
     propose_rx: CcReceiver<ProposeRequest>,
     conf_change_rx: CcReceiver<ConfChangeRequest>,
+    read_index_rx: CcReceiver<ReadIndexRequest>,
     msg_out_tx: mpsc::Sender<Vec<Message>>,
 }
 
@@ -45,14 +46,34 @@ pub struct ConfChangeRequest {
     pub tx: oneshot::Sender<Result<(), RaftError>>,
 }
 
+/// A ReadIndex request with a unique context and a oneshot channel for the result.
+/// The event loop calls `node.read_index(context)` which triggers a heartbeat-based
+/// leader confirmation. Once confirmed, the commit index is returned.
+pub struct ReadIndexRequest {
+    pub context: Vec<u8>,
+    pub tx: oneshot::Sender<Result<u64, RaftError>>,
+}
+
 /// Shared state between the event loop and RaftHandleImpl.
-#[derive(Default)]
 pub struct RaftSharedState {
     pub leader_id: AtomicU64,
     /// Last committed index seen by the event loop (for ReadIndex).
     pub commit_index: AtomicU64,
     /// Last applied index (updated after state machine apply, for ReadIndex wait).
     pub applied_index: AtomicU64,
+    /// Notified after each apply batch so waiters can check applied_index.
+    pub applied_notify: Notify,
+}
+
+impl Default for RaftSharedState {
+    fn default() -> Self {
+        Self {
+            leader_id: AtomicU64::new(0),
+            commit_index: AtomicU64::new(0),
+            applied_index: AtomicU64::new(0),
+            applied_notify: Notify::new(),
+        }
+    }
 }
 
 /// Handle to a running raft node, returned by [`start_raft_node`].
@@ -65,6 +86,8 @@ pub struct RaftNodeHandle {
     pub propose_tx: mpsc::Sender<ProposeRequest>,
     /// Sender for ConfChange proposals (add_learner, change_membership).
     pub conf_change_tx: mpsc::Sender<ConfChangeRequest>,
+    /// Sender for ReadIndex requests (linearizable reads).
+    pub read_index_tx: mpsc::Sender<ReadIndexRequest>,
     /// Shared state for leader tracking.
     pub shared_state: Arc<RaftSharedState>,
 }
@@ -82,11 +105,13 @@ pub fn start_raft_node(
     let (msg_in_tx, mut msg_in_rx) = mpsc::channel::<Message>(1024);
     let (propose_tx, mut propose_rx) = mpsc::channel::<ProposeRequest>(1024);
     let (conf_change_tx, mut conf_change_rx) = mpsc::channel::<ConfChangeRequest>(1024);
+    let (read_index_tx, mut read_index_rx) = mpsc::channel::<ReadIndexRequest>(1024);
 
     // Crossbeam channels for the event loop's blocking select!.
     let (cc_msg_tx, cc_msg_rx) = cc::bounded::<Message>(1024);
     let (cc_propose_tx, cc_propose_rx) = cc::bounded::<ProposeRequest>(1024);
     let (cc_conf_tx, cc_conf_rx) = cc::bounded::<ConfChangeRequest>(1024);
+    let (cc_ri_tx, cc_ri_rx) = cc::bounded::<ReadIndexRequest>(1024);
 
     // Bridge: forward from tokio channels to crossbeam channels.
     tokio::spawn(async move {
@@ -110,6 +135,13 @@ pub fn start_raft_node(
             }
         }
     });
+    tokio::spawn(async move {
+        while let Some(req) = read_index_rx.recv().await {
+            if cc_ri_tx.send(req).is_err() {
+                break;
+            }
+        }
+    });
 
     let shared_state = Arc::new(RaftSharedState::default());
     let shared = shared_state.clone();
@@ -125,6 +157,7 @@ pub fn start_raft_node(
         msg_in_rx: cc_msg_rx,
         propose_rx: cc_propose_rx,
         conf_change_rx: cc_conf_rx,
+        read_index_rx: cc_ri_rx,
         msg_out_tx,
     };
 
@@ -137,6 +170,7 @@ pub fn start_raft_node(
         msg_tx: msg_in_tx,
         propose_tx,
         conf_change_tx,
+        read_index_tx,
         shared_state,
     })
 }
@@ -160,6 +194,7 @@ fn raft_event_loop(
         msg_in_rx,
         propose_rx,
         conf_change_rx,
+        read_index_rx,
         msg_out_tx,
     } = channels;
 
@@ -193,6 +228,10 @@ fn raft_event_loop(
     // ConfChange proposals: (node_id, change_type) → response sender.
     // Keyed by identity rather than index so each commit resolves only its matching sender.
     let mut pending_conf: HashMap<(u64, i32), oneshot::Sender<Result<(), RaftError>>> =
+        HashMap::new();
+    // ReadIndex requests: context bytes → response sender.
+    // Resolved when read_states in a Ready matches the context.
+    let mut pending_read_index: HashMap<Vec<u8>, oneshot::Sender<Result<u64, RaftError>>> =
         HashMap::new();
     let mut request_id_counter: u64 = 0;
     let mut was_leader = false;
@@ -232,6 +271,7 @@ fn raft_event_loop(
         let mut msgs = Vec::new();
         let mut props = Vec::new();
         let mut ccs = Vec::new();
+        let mut ris = Vec::new();
 
         // Collect all immediately available messages (non-blocking).
         while let Ok(msg) = msg_in_rx.try_recv() {
@@ -243,9 +283,12 @@ fn raft_event_loop(
         while let Ok(cc_req) = conf_change_rx.try_recv() {
             ccs.push(cc_req);
         }
+        while let Ok(ri_req) = read_index_rx.try_recv() {
+            ris.push(ri_req);
+        }
 
         // If nothing was immediately available, block until something arrives or tick fires.
-        if msgs.is_empty() && props.is_empty() && ccs.is_empty() {
+        if msgs.is_empty() && props.is_empty() && ccs.is_empty() && ris.is_empty() {
             cc::select! {
                 recv(msg_in_rx) -> msg => {
                     if let Ok(m) = msg { msgs.push(m); }
@@ -258,6 +301,10 @@ fn raft_event_loop(
                 recv(conf_change_rx) -> cc_req => {
                     if let Ok(c) = cc_req { ccs.push(c); }
                     while let Ok(c) = conf_change_rx.try_recv() { ccs.push(c); }
+                }
+                recv(read_index_rx) -> ri_req => {
+                    if let Ok(r) = ri_req { ris.push(r); }
+                    while let Ok(r) = read_index_rx.try_recv() { ris.push(r); }
                 }
                 recv(cc::after(tick_interval)) -> _ => {}
             }
@@ -286,6 +333,20 @@ fn raft_event_loop(
             }
             let key = (req.cc.node_id, req.cc.change_type);
             pending_conf.insert(key, req.tx);
+        }
+
+        // Process ReadIndex requests: call read_index on the RawNode which
+        // triggers a heartbeat to confirm leadership. The commit index at
+        // request time will be returned via read_states in a future Ready.
+        for req in ris {
+            if node.raft.state != StateRole::Leader {
+                let _ = req.tx.send(Err(RaftError::NotLeader {
+                    leader: Some(node.raft.leader_id),
+                }));
+                continue;
+            }
+            node.read_index(req.context.clone());
+            pending_read_index.insert(req.context, req.tx);
         }
 
         // Process normal proposals.
@@ -454,6 +515,23 @@ fn raft_event_loop(
                         }
                     }
                 }
+
+                // Notify waiters that applied_index has advanced.
+                shared_state.applied_notify.notify_waiters();
+            }
+
+            // Process ReadIndex responses: match each read state's context
+            // against pending read index requests and resolve them.
+            for rs in ready.take_read_states() {
+                if let Some(tx) = pending_read_index.remove(&rs.request_ctx) {
+                    let _ = tx.send(Ok(rs.index));
+                } else {
+                    tracing::debug!(
+                        index = rs.index,
+                        ctx_len = rs.request_ctx.len(),
+                        "read state context not found in pending (likely timed out)"
+                    );
+                }
             }
 
             let is_leader = node.raft.state == StateRole::Leader;
@@ -462,6 +540,9 @@ fn raft_event_loop(
                     let _ = tx.send(Err(RaftError::NotLeader { leader: None }));
                 }
                 for (_, tx) in pending_conf.drain() {
+                    let _ = tx.send(Err(RaftError::NotLeader { leader: None }));
+                }
+                for (_, tx) in pending_read_index.drain() {
                     let _ = tx.send(Err(RaftError::NotLeader { leader: None }));
                 }
             }
@@ -615,6 +696,9 @@ fn apply_snapshot_to_state(
     if let Err(e) = store.save_applied_index(index) {
         tracing::error!(error = %e, "failed to persist applied index after snapshot");
     }
+
+    // Wake any linearizable-read waiters so they can observe the new index.
+    shared_state.applied_notify.notify_waiters();
 
     tracing::info!(index, term, "applied snapshot from leader");
     Ok(())

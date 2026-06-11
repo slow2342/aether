@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use raft::eraftpb::{ConfChange, ConfChangeType};
@@ -6,7 +7,7 @@ use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
 use super::handle::{RaftError, RaftHandle};
-use super::node::{ConfChangeRequest, ProposeRequest, RaftSharedState};
+use super::node::{ConfChangeRequest, ProposeRequest, RaftSharedState, ReadIndexRequest};
 use super::{NodeId, RaftRequest, RaftResponse};
 
 /// raft-rs based implementation of RaftHandle.
@@ -15,25 +16,30 @@ use super::{NodeId, RaftRequest, RaftResponse};
 pub struct RaftRsHandle {
     propose_tx: mpsc::Sender<ProposeRequest>,
     conf_change_tx: mpsc::Sender<ConfChangeRequest>,
+    read_index_tx: mpsc::Sender<ReadIndexRequest>,
     shared_state: Arc<RaftSharedState>,
     // Uses std::sync::RwLock (not tokio::sync::RwLock) because members() is a
     // sync method on the trait, and write operations (add_learner, change_membership)
     // only hold the lock during synchronous mutations — no .await while guarded.
     members: RwLock<Vec<(u64, String)>>,
+    read_index_counter: AtomicU64,
 }
 
 impl RaftRsHandle {
     pub fn new(
         propose_tx: mpsc::Sender<ProposeRequest>,
         conf_change_tx: mpsc::Sender<ConfChangeRequest>,
+        read_index_tx: mpsc::Sender<ReadIndexRequest>,
         shared_state: Arc<RaftSharedState>,
         members: Vec<(u64, String)>,
     ) -> Self {
         Self {
             propose_tx,
             conf_change_tx,
+            read_index_tx,
             shared_state,
             members: RwLock::new(members),
+            read_index_counter: AtomicU64::new(0),
         }
     }
 }
@@ -80,6 +86,22 @@ impl RaftHandle for RaftRsHandle {
         self.shared_state
             .applied_index
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn wait_for_apply(&self) {
+        self.shared_state.applied_notify.notified().await;
+    }
+
+    async fn read_index(&self) -> Result<u64, RaftError> {
+        let id = self.read_index_counter.fetch_add(1, Ordering::Relaxed);
+        let context = id.to_be_bytes().to_vec();
+        let (tx, rx) = oneshot::channel();
+        self.read_index_tx
+            .send(ReadIndexRequest { context, tx })
+            .await
+            .map_err(|_| RaftError::ChannelClosed)?;
+
+        rx.await.map_err(|_| RaftError::ChannelClosed)?
     }
 
     fn members(&self) -> Vec<(u64, String)> {

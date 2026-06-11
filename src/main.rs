@@ -245,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
         msg_tx: msg_in_tx,
         propose_tx,
         conf_change_tx,
+        read_index_tx,
         shared_state,
     } = node::start_raft_node(
         raft_config,
@@ -276,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
     let raft_handle: Arc<dyn RaftHandle> = Arc::new(RaftRsHandle::new(
         propose_tx,
         conf_change_tx,
+        read_index_tx,
         shared_state,
         initial_peers.clone(),
     ));
