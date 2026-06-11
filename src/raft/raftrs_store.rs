@@ -151,6 +151,33 @@ impl RaftRsStore {
         Ok(())
     }
 
+    /// Save applied index to raft_state CF.
+    pub fn save_applied_index(&self, index: u64) -> RaftResult<()> {
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .put_cf_opt(
+                self.state_cf(),
+                b"applied_index",
+                index.to_be_bytes(),
+                &opts,
+            )
+            .map_err(|e| RaftError::Store(StorageError::Other(e.into())))?;
+        Ok(())
+    }
+
+    /// Load applied index from raft_state CF (returns 0 if not found).
+    pub fn load_applied_index(&self) -> RaftResult<u64> {
+        match self
+            .db
+            .get_cf(self.state_cf(), b"applied_index")
+            .map_err(|e| RaftError::Store(StorageError::Other(e.into())))?
+        {
+            Some(data) if data.len() == 8 => Ok(u64::from_be_bytes(data[..8].try_into().unwrap())),
+            _ => Ok(0),
+        }
+    }
+
     /// Compact log entries up to `compact_index` (exclusive).
     pub fn compact(&self, compact_index: u64) -> RaftResult<()> {
         let first = self.first_index()?;
