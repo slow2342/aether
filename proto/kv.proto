@@ -89,6 +89,8 @@ message RangeRequest {
     int64 revision = 4;
     SortOrder sort_order = 5;
     SortTarget sort_target = 6;
+    // serializable enables serializable reads (may read stale data).
+    bool serializable = 7;
 }
 
 message RangeResponse {

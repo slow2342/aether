@@ -159,12 +159,19 @@ impl<S: StorageEngine> KvService<S> {
             .map_err(|e| Status::internal(format!("raft write failed: {e}")))
     }
 
-    /// Perform a linearizable read: confirm leadership, then wait until the
-    /// state machine has applied up to the commit index. This guarantees the
-    /// read reflects all previously committed entries.
+    /// Perform a linearizable read via ReadIndex: send a heartbeat to confirm
+    /// leadership, get the commit index at confirmation time, then wait until
+    /// the state machine has applied up to that index.
     async fn linearizable_read(&self) -> Result<(), Status> {
-        let commit_idx = ensure_linearizable(self.raft.as_ref(), self.node_id)?;
-        // Wait for state machine to catch up (poll with timeout)
+        let commit_idx = ensure_linearizable(self.raft.as_ref()).await?;
+        // Wait for state machine to catch up using Notify instead of polling.
+        //
+        // There is a small race window: Notify::notified() registers a waker
+        // only when first polled (inside timeout().await). Between the
+        // applied_index check and that poll, the event loop could apply entries
+        // and call notify_waiters(), losing the notification. In that case we
+        // wait one extra raft tick (≤100ms) before the next apply+notify cycle
+        // wakes us. This is acceptable — the 5s deadline bounds total latency.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             if self.raft.applied_index() >= commit_idx {
@@ -175,7 +182,8 @@ impl<S: StorageEngine> KvService<S> {
                     "timed out waiting for state machine to apply",
                 ));
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            let remaining = deadline - tokio::time::Instant::now();
+            let _ = tokio::time::timeout(remaining, self.raft.wait_for_apply()).await;
         }
     }
 }
@@ -368,7 +376,9 @@ impl<S: StorageEngine> AetherKv for KvService<S> {
                 PermissionType::Read,
             )?;
         }
-        self.linearizable_read().await?;
+        if !request.get_ref().serializable {
+            self.linearizable_read().await?;
+        }
         let req = request.into_inner();
         if req.key.is_empty() {
             return Err(Status::invalid_argument("key must not be empty"));
