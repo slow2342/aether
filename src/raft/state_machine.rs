@@ -1,12 +1,38 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rocksdb::WriteBatch;
 
-use super::{RaftRequest, RaftResponse, WatchEvent};
+use super::{KeyValue, RaftRequest, RaftResponse, WatchEvent};
 use crate::auth::AuthCache;
 use crate::lease::{LeaseManager, LeaseStore};
+use crate::storage::mvcc::{
+    KeyIndex, MvccValue, encode_mvcc_key, load_key_indexes, save_global_revision,
+};
 use crate::storage::{RocksStorage, StorageEngine};
+
+/// Per-key metadata tracked in memory and persisted to the meta CF.
+#[derive(Debug, Clone)]
+pub struct KeyMeta {
+    pub create_revision: i64,
+    pub mod_revision: i64,
+    pub version: i64,
+    pub lease: i64,
+}
+
+impl KeyMeta {
+    fn to_kv(&self, key: Vec<u8>, value: Vec<u8>) -> KeyValue {
+        KeyValue {
+            key,
+            value,
+            create_revision: self.create_revision,
+            mod_revision: self.mod_revision,
+            version: self.version,
+            lease: self.lease,
+        }
+    }
+}
 
 /// Aether state machine implementation.
 /// All user data is stored in RocksDB.
@@ -29,6 +55,10 @@ pub struct AetherStateMachine {
     pub auth_cache: Arc<AuthCache>,
     /// Shared auth enabled flag (updated on AuthEnable/AuthDisable)
     pub auth_enabled: Arc<AtomicBool>,
+    /// MVCC: per-key version history index (rebuilt from mvcc CF on startup)
+    pub key_indexes: HashMap<Vec<u8>, KeyIndex>,
+    /// MVCC: per-key current metadata (create_revision, mod_revision, version, lease)
+    pub key_metas: HashMap<Vec<u8>, KeyMeta>,
 }
 
 impl AetherStateMachine {
@@ -40,6 +70,9 @@ impl AetherStateMachine {
         auth_cache: Arc<AuthCache>,
         auth_enabled: Arc<AtomicBool>,
     ) -> Self {
+        let key_indexes = load_key_indexes(storage.db(), storage.mvcc_cf())
+            .expect("failed to load key indexes from mvcc CF");
+        let key_metas = Self::load_key_metas_from_indexes(&storage, &key_indexes);
         Self {
             last_applied: 0,
             storage,
@@ -48,7 +81,37 @@ impl AetherStateMachine {
             lease_store,
             auth_cache,
             auth_enabled,
+            key_indexes,
+            key_metas,
         }
+    }
+
+    /// Load per-key metadata from pre-loaded key indexes.
+    fn load_key_metas_from_indexes(
+        storage: &RocksStorage,
+        key_indexes: &HashMap<Vec<u8>, KeyIndex>,
+    ) -> HashMap<Vec<u8>, KeyMeta> {
+        let mut metas = HashMap::new();
+        for (user_key, ki) in key_indexes {
+            if let Some(rev) = ki.get(0) {
+                let mvcc_key = encode_mvcc_key(user_key, rev);
+                if let Ok(Some(bytes)) = storage.db().get_cf(storage.mvcc_cf(), &mvcc_key)
+                    && !bytes.is_empty()
+                    && let Ok(mv) = rkyv::from_bytes::<MvccValue, rkyv::rancor::BoxedError>(&bytes)
+                {
+                    metas.insert(
+                        user_key.clone(),
+                        KeyMeta {
+                            create_revision: mv.create_revision,
+                            mod_revision: mv.mod_revision,
+                            version: mv.version,
+                            lease: mv.lease,
+                        },
+                    );
+                }
+            }
+        }
+        metas
     }
 
     fn storage_get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -61,38 +124,62 @@ impl AetherStateMachine {
         }
     }
 
-    fn storage_range(&self, key: &[u8], range_end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let end = if range_end == b"\0" { &[] } else { range_end };
-        match self.storage.range_scan(key, end, usize::MAX) {
-            Ok(kvs) => kvs.into_iter().map(|kv| (kv.key, kv.value)).collect(),
-            Err(e) => {
-                tracing::error!(error = %e, key = ?key, "storage range_scan failed");
-                vec![]
-            }
-        }
-    }
-
-    /// Apply a request to the state machine
-    fn apply_request(&mut self, request: RaftRequest) -> RaftResponse {
+    /// Apply a request to the state machine.
+    /// `revision` is the Raft log entry index used as the global MVCC revision.
+    fn apply_request(&mut self, request: RaftRequest, revision: u64) -> RaftResponse {
         match request {
             RaftRequest::Put {
                 key,
                 value,
                 lease_id,
             } => {
-                let prev_kv = self.storage_get(&key).map(|v| super::KeyValue {
-                    key: key.clone(),
-                    value: v,
-                    create_revision: 0,
-                    mod_revision: 0,
-                    version: 0,
-                    lease: 0,
-                });
+                // Read existing metadata for prev_kv response.
+                let prev_kv = self
+                    .key_metas
+                    .get(&key)
+                    .map(|m| m.to_kv(key.clone(), self.storage_get(&key).unwrap_or_default()));
 
-                // Combine data write and lease association into a single WriteBatch
-                // for atomicity — both succeed or both fail.
+                // Compute new MVCC metadata.
+                let rev = revision as i64;
+                let (create_rev, ver) = match self.key_metas.get(&key) {
+                    Some(old) => (old.create_revision, old.version + 1),
+                    None => (rev, 1),
+                };
+                let new_meta = KeyMeta {
+                    create_revision: create_rev,
+                    mod_revision: rev,
+                    version: ver,
+                    lease: lease_id,
+                };
+
+                // Write MVCC versioned entry + default CF atomically.
+                let mvcc_val = MvccValue {
+                    create_revision: new_meta.create_revision,
+                    mod_revision: new_meta.mod_revision,
+                    version: new_meta.version,
+                    lease: new_meta.lease,
+                    value: value.clone(),
+                };
+                let mvcc_val_bytes = match rkyv::to_bytes::<rkyv::rancor::BoxedError>(&mvcc_val) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to serialize mvcc value");
+                        return RaftResponse::Error {
+                            message: format!("serialize failed: {e}"),
+                        };
+                    }
+                };
+                let mvcc_key = encode_mvcc_key(&key, revision);
+
+                // Prepare key_index mutation on a clone to avoid corrupting
+                // in-memory state if the WriteBatch fails.
+                let mut new_ki = self.key_indexes.get(&key).cloned().unwrap_or_default();
+                new_ki.put(revision);
+
                 let mut batch = WriteBatch::default();
                 batch.put_cf(self.storage.default_cf(), &key, &value);
+                batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, mvcc_val_bytes.as_ref());
+                save_global_revision(&mut batch, self.storage.meta_cf(), revision);
 
                 let old_lease_id = if lease_id > 0 {
                     let old = self.lease_store.get_key_lease_id(&key).ok().flatten();
@@ -110,6 +197,10 @@ impl AetherStateMachine {
                     };
                 }
 
+                // Update in-memory state after successful persistence.
+                self.key_indexes.insert(key.clone(), new_ki);
+                self.key_metas.insert(key.clone(), new_meta);
+
                 if lease_id > 0 {
                     let mut mgr = self.lease_manager.lock().unwrap();
                     if let Some(old_id) = old_lease_id
@@ -121,16 +212,10 @@ impl AetherStateMachine {
                     mgr.attach_key(lease_id, key.clone());
                 }
 
+                let kv = self.key_metas.get(&key).unwrap().to_kv(key.clone(), value);
                 let _ = self.watch_tx.send(WatchEvent {
                     event_type: super::WatchEventType::Put,
-                    kv: super::KeyValue {
-                        key,
-                        value,
-                        create_revision: 0,
-                        mod_revision: 0,
-                        version: 0,
-                        lease: lease_id,
-                    },
+                    kv: kv.clone(),
                     prev_kv: prev_kv.clone(),
                 });
 
@@ -141,76 +226,117 @@ impl AetherStateMachine {
                 let prev_kvs;
 
                 if range_end.is_empty() {
-                    match self.storage_get(&key) {
-                        Some(value) => {
-                            let mut batch = WriteBatch::default();
-                            let detach_ops = self
-                                .lease_store
-                                .batch_lease_cleanup(std::slice::from_ref(&key), &mut batch)
-                                .unwrap_or_default();
-                            batch.delete_cf(self.storage.default_cf(), &key);
-                            if let Err(e) = self.storage.db().write(batch) {
-                                tracing::error!(error = %e, "failed to delete from storage");
-                                return RaftResponse::Error {
-                                    message: format!("delete failed: {e}"),
-                                };
-                            }
-                            {
-                                let mut mgr = self.lease_manager.lock().unwrap();
-                                for (lease_id, k) in &detach_ops {
-                                    mgr.detach_key(*lease_id, k);
-                                }
-                            }
-                            deleted = 1;
-                            prev_kvs = vec![super::KeyValue {
-                                key: key.clone(),
-                                value,
-                                create_revision: 0,
-                                mod_revision: 0,
-                                version: 0,
-                                lease: 0,
-                            }];
+                    // Single key delete.
+                    if self.key_metas.contains_key(&key) {
+                        let meta = self.key_metas.get(&key).unwrap().clone();
+                        let value = self.storage_get(&key).unwrap_or_default();
+                        let prev_kv = meta.to_kv(key.clone(), value);
+
+                        // Prepare key_index mutation on a clone.
+                        let mut new_ki = self.key_indexes.get(&key).cloned().unwrap_or_default();
+                        new_ki.tombstone(revision);
+
+                        let mut batch = WriteBatch::default();
+                        let detach_ops = self
+                            .lease_store
+                            .batch_lease_cleanup(std::slice::from_ref(&key), &mut batch)
+                            .unwrap_or_default();
+                        batch.delete_cf(self.storage.default_cf(), &key);
+
+                        // Write MVCC tombstone.
+                        let mvcc_key = encode_mvcc_key(&key, revision);
+                        batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
+                        save_global_revision(&mut batch, self.storage.meta_cf(), revision);
+
+                        if let Err(e) = self.storage.db().write(batch) {
+                            tracing::error!(error = %e, "failed to delete from storage");
+                            return RaftResponse::Error {
+                                message: format!("delete failed: {e}"),
+                            };
                         }
-                        None => {
-                            deleted = 0;
-                            prev_kvs = vec![];
+
+                        // Update in-memory state after successful persistence.
+                        self.key_indexes.insert(key.clone(), new_ki);
+                        self.key_metas.remove(&key);
+                        {
+                            let mut mgr = self.lease_manager.lock().unwrap();
+                            for (lease_id, k) in &detach_ops {
+                                mgr.detach_key(*lease_id, k);
+                            }
                         }
+                        deleted = 1;
+                        prev_kvs = vec![prev_kv];
+                    } else {
+                        deleted = 0;
+                        prev_kvs = vec![];
                     }
                 } else {
-                    let pairs = self.storage_range(&key, &range_end);
-                    let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
-                    let mut batch = WriteBatch::default();
-                    let detach_ops = self
-                        .lease_store
-                        .batch_lease_cleanup(&keys, &mut batch)
-                        .unwrap_or_default();
-                    for k in &keys {
-                        batch.delete_cf(self.storage.default_cf(), k);
-                    }
-                    if let Err(e) = self.storage.db().write(batch) {
-                        tracing::error!(error = %e, "failed to batch delete from storage");
-                        return RaftResponse::Error {
-                            message: format!("batch delete failed: {e}"),
-                        };
-                    }
-                    {
-                        let mut mgr = self.lease_manager.lock().unwrap();
-                        for (lease_id, k) in &detach_ops {
-                            mgr.detach_key(*lease_id, k);
+                    // Range delete.
+                    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+                    let mut prevs: Vec<KeyValue> = Vec::new();
+
+                    // Collect keys that exist in key_metas within the range.
+                    for (k, meta) in &self.key_metas {
+                        if k.as_slice() >= key.as_slice()
+                            && (range_end == b"\0" || k.as_slice() < range_end.as_slice())
+                        {
+                            let value = self.storage_get(k).unwrap_or_default();
+                            prevs.push(meta.to_kv(k.clone(), value));
+                            keys_to_delete.push(k.clone());
                         }
                     }
-                    deleted = pairs.len() as i64;
-                    prev_kvs = pairs
-                        .into_iter()
-                        .map(|(k, v)| super::KeyValue {
-                            key: k,
-                            value: v,
-                            create_revision: 0,
-                            mod_revision: 0,
-                            version: 0,
-                            lease: 0,
-                        })
-                        .collect();
+                    keys_to_delete.sort();
+
+                    if keys_to_delete.is_empty() {
+                        deleted = 0;
+                        prev_kvs = vec![];
+                    } else {
+                        // Prepare key_index mutations on clones.
+                        let mut ki_mutations: Vec<(Vec<u8>, KeyIndex)> = Vec::new();
+                        for k in &keys_to_delete {
+                            let mut new_ki = self.key_indexes.get(k).cloned().unwrap_or_default();
+                            new_ki.tombstone(revision);
+                            ki_mutations.push((k.clone(), new_ki));
+                        }
+
+                        let mut batch = WriteBatch::default();
+                        let detach_ops = self
+                            .lease_store
+                            .batch_lease_cleanup(&keys_to_delete, &mut batch)
+                            .unwrap_or_default();
+
+                        for k in &keys_to_delete {
+                            batch.delete_cf(self.storage.default_cf(), k);
+
+                            // Write MVCC tombstone.
+                            let mvcc_key = encode_mvcc_key(k, revision);
+                            batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
+                        }
+                        save_global_revision(&mut batch, self.storage.meta_cf(), revision);
+
+                        if let Err(e) = self.storage.db().write(batch) {
+                            tracing::error!(error = %e, "failed to batch delete from storage");
+                            return RaftResponse::Error {
+                                message: format!("batch delete failed: {e}"),
+                            };
+                        }
+
+                        // Update in-memory state after successful persistence.
+                        for (k, ki) in ki_mutations {
+                            self.key_indexes.insert(k, ki);
+                        }
+                        for k in &keys_to_delete {
+                            self.key_metas.remove(k);
+                        }
+                        {
+                            let mut mgr = self.lease_manager.lock().unwrap();
+                            for (lease_id, k) in &detach_ops {
+                                mgr.detach_key(*lease_id, k);
+                            }
+                        }
+                        deleted = keys_to_delete.len() as i64;
+                        prev_kvs = prevs;
+                    }
                 }
 
                 for kv in &prev_kvs {
@@ -229,6 +355,7 @@ impl AetherStateMachine {
                 failure,
             } => {
                 let succeeded = compare.iter().all(|cmp| {
+                    let meta = self.key_metas.get(&cmp.key);
                     let current_value = self.storage_get(&cmp.key);
                     match (&cmp.target, &cmp.target_union) {
                         (super::CompareTarget::Value, super::TargetUnion::Value(expected)) => {
@@ -247,6 +374,25 @@ impl AetherStateMachine {
                                     .is_some_and(|v| v < expected.as_slice()),
                             }
                         }
+                        (super::CompareTarget::Version, super::TargetUnion::Version(expected)) => {
+                            let current = meta.map_or(0i64, |m| m.version);
+                            Self::compare_i64(cmp.result, current, *expected)
+                        }
+                        (
+                            super::CompareTarget::Create,
+                            super::TargetUnion::CreateRevision(expected),
+                        ) => {
+                            let current = meta.map_or(0i64, |m| m.create_revision);
+                            Self::compare_i64(cmp.result, current, *expected)
+                        }
+                        (super::CompareTarget::Mod, super::TargetUnion::ModRevision(expected)) => {
+                            let current = meta.map_or(0i64, |m| m.mod_revision);
+                            Self::compare_i64(cmp.result, current, *expected)
+                        }
+                        (super::CompareTarget::Lease, super::TargetUnion::Lease(expected)) => {
+                            let current = meta.map_or(0i64, |m| m.lease);
+                            Self::compare_i64(cmp.result, current, *expected)
+                        }
                         _ => false,
                     }
                 });
@@ -263,9 +409,14 @@ impl AetherStateMachine {
                                     value: put.value.clone(),
                                     lease_id: put.lease,
                                 };
-                                match self.apply_request(raft_req) {
+                                match self.apply_request(raft_req, revision) {
                                     RaftResponse::Put { prev_kv } => {
                                         super::Response::Put(super::PutResponse { prev_kv })
+                                    }
+                                    RaftResponse::Error { message } => {
+                                        return RaftResponse::Error {
+                                            message: format!("txn put failed: {message}"),
+                                        };
                                     }
                                     _ => continue,
                                 }
@@ -275,40 +426,42 @@ impl AetherStateMachine {
                                     key: del.key.clone(),
                                     range_end: del.range_end.clone(),
                                 };
-                                match self.apply_request(raft_req) {
+                                match self.apply_request(raft_req, revision) {
                                     RaftResponse::Delete { deleted, prev_kvs } => {
                                         super::Response::Delete(super::DeleteResponse {
                                             deleted,
                                             prev_kvs,
                                         })
                                     }
+                                    RaftResponse::Error { message } => {
+                                        return RaftResponse::Error {
+                                            message: format!("txn delete failed: {message}"),
+                                        };
+                                    }
                                     _ => continue,
                                 }
                             }
                             super::Request::Get(get) => {
                                 let kvs = if get.range_end.is_empty() {
-                                    match self.storage_get(&get.key) {
-                                        Some(value) => vec![super::KeyValue {
-                                            key: get.key.clone(),
-                                            value,
-                                            create_revision: 0,
-                                            mod_revision: 0,
-                                            version: 0,
-                                            lease: 0,
-                                        }],
+                                    match self.key_metas.get(&get.key) {
+                                        Some(meta) => {
+                                            let value =
+                                                self.storage_get(&get.key).unwrap_or_default();
+                                            vec![meta.to_kv(get.key.clone(), value)]
+                                        }
                                         None => vec![],
                                     }
                                 } else {
-                                    let pairs = self.storage_range(&get.key, &get.range_end);
-                                    pairs
-                                        .into_iter()
-                                        .map(|(k, v)| super::KeyValue {
-                                            key: k,
-                                            value: v,
-                                            create_revision: 0,
-                                            mod_revision: 0,
-                                            version: 0,
-                                            lease: 0,
+                                    self.key_metas
+                                        .iter()
+                                        .filter(|(k, _)| {
+                                            k.as_slice() >= get.key.as_slice()
+                                                && (get.range_end == b"\0"
+                                                    || k.as_slice() < get.range_end.as_slice())
+                                        })
+                                        .map(|(k, meta)| {
+                                            let value = self.storage_get(k).unwrap_or_default();
+                                            meta.to_kv(k.clone(), value)
                                         })
                                         .collect()
                                 };
@@ -316,25 +469,29 @@ impl AetherStateMachine {
                                 super::Response::Get(super::RangeResponse { kvs, count })
                             }
                             super::Request::Range(range) => {
-                                let pairs = if range.range_end.is_empty() {
-                                    match self.storage_get(&range.key) {
-                                        Some(value) => vec![(range.key.clone(), value)],
+                                let kvs: Vec<KeyValue> = if range.range_end.is_empty() {
+                                    match self.key_metas.get(&range.key) {
+                                        Some(meta) => {
+                                            let value =
+                                                self.storage_get(&range.key).unwrap_or_default();
+                                            vec![meta.to_kv(range.key.clone(), value)]
+                                        }
                                         None => vec![],
                                     }
                                 } else {
-                                    self.storage_range(&range.key, &range.range_end)
+                                    self.key_metas
+                                        .iter()
+                                        .filter(|(k, _)| {
+                                            k.as_slice() >= range.key.as_slice()
+                                                && (range.range_end == b"\0"
+                                                    || k.as_slice() < range.range_end.as_slice())
+                                        })
+                                        .map(|(k, meta)| {
+                                            let value = self.storage_get(k).unwrap_or_default();
+                                            meta.to_kv(k.clone(), value)
+                                        })
+                                        .collect()
                                 };
-                                let kvs: Vec<_> = pairs
-                                    .into_iter()
-                                    .map(|(k, v)| super::KeyValue {
-                                        key: k,
-                                        value: v,
-                                        create_revision: 0,
-                                        mod_revision: 0,
-                                        version: 0,
-                                        lease: 0,
-                                    })
-                                    .collect();
                                 let count = kvs.len() as i64;
                                 super::Response::Range(super::RangeResponse { kvs, count })
                             }
@@ -355,7 +512,7 @@ impl AetherStateMachine {
             RaftRequest::LeaseGrant { ttl, expiry_time } => {
                 self.apply_lease_grant(ttl, expiry_time)
             }
-            RaftRequest::LeaseRevoke { id } => self.apply_lease_revoke(id),
+            RaftRequest::LeaseRevoke { id } => self.apply_lease_revoke(id, revision),
             RaftRequest::LeaseKeepAlive { id, expiry_time } => {
                 self.apply_lease_keep_alive(id, expiry_time)
             }
@@ -386,6 +543,15 @@ impl AetherStateMachine {
                 self.apply_auth_enable(root_password_hash)
             }
             RaftRequest::AuthDisable {} => self.apply_auth_disable(),
+        }
+    }
+
+    fn compare_i64(result: super::CompareResult, current: i64, expected: i64) -> bool {
+        match result {
+            super::CompareResult::Equal => current == expected,
+            super::CompareResult::NotEqual => current != expected,
+            super::CompareResult::Greater => current > expected,
+            super::CompareResult::Less => current < expected,
         }
     }
 
@@ -436,9 +602,9 @@ impl AetherStateMachine {
         RaftResponse::LeaseGrant { id, ttl }
     }
 
-    fn apply_lease_revoke(&mut self, id: i64) -> RaftResponse {
+    fn apply_lease_revoke(&mut self, id: i64, revision: u64) -> RaftResponse {
         // Read keys and values under lock, then drop before I/O.
-        let key_values: Vec<(Vec<u8>, Vec<u8>)> = {
+        let key_values: Vec<(Vec<u8>, Vec<u8>, Option<KeyMeta>)> = {
             let mgr = self.lease_manager.lock().unwrap();
             let keys = match mgr.get_keys(id) {
                 Some(s) => s.iter().cloned().collect::<Vec<_>>(),
@@ -447,23 +613,37 @@ impl AetherStateMachine {
             keys.into_iter()
                 .map(|k| {
                     let v = self.storage_get(&k).unwrap_or_default();
-                    (k, v)
+                    let meta = self.key_metas.get(&k).cloned();
+                    (k, v, meta)
                 })
                 .collect()
         };
 
+        // Prepare key_index mutations on clones.
+        let mut ki_mutations: Vec<(Vec<u8>, KeyIndex)> = Vec::new();
+        for (key, _, _) in &key_values {
+            let mut new_ki = self.key_indexes.get(key).cloned().unwrap_or_default();
+            new_ki.tombstone(revision);
+            ki_mutations.push((key.clone(), new_ki));
+        }
+
         let mut batch = rocksdb::WriteBatch::default();
         let default_cf = self.storage.default_cf();
 
-        for (key, _) in &key_values {
+        for (key, _, _) in &key_values {
             batch.delete_cf(default_cf, key);
             batch.delete_cf(self.storage.key_lease_cf(), key);
             let mut lk_key = Vec::with_capacity(8 + key.len());
             lk_key.extend_from_slice(&id.to_be_bytes());
             lk_key.extend_from_slice(key);
             batch.delete_cf(self.storage.lease_keys_cf(), lk_key);
+
+            // Write MVCC tombstone.
+            let mvcc_key = encode_mvcc_key(key, revision);
+            batch.put_cf(self.storage.mvcc_cf(), &mvcc_key, b"");
         }
         batch.delete_cf(self.storage.lease_cf(), id.to_be_bytes());
+        save_global_revision(&mut batch, self.storage.meta_cf(), revision);
 
         if let Err(e) = self.storage.db().write(batch) {
             tracing::error!(error = %e, lease_id = id, "failed to batch delete on revoke");
@@ -472,12 +652,19 @@ impl AetherStateMachine {
             };
         }
 
+        // Update in-memory state after successful persistence.
+        for (key, ki) in ki_mutations {
+            self.key_indexes.insert(key, ki);
+        }
+        for (key, _, _) in &key_values {
+            self.key_metas.remove(key);
+        }
         self.lease_manager.lock().unwrap().revoke(id);
 
-        for (key, value) in key_values {
-            let _ = self.watch_tx.send(WatchEvent {
-                event_type: super::WatchEventType::Delete,
-                kv: super::KeyValue {
+        for (key, value, meta) in key_values {
+            let kv = match meta {
+                Some(m) => m.to_kv(key, value),
+                None => KeyValue {
                     key,
                     value,
                     create_revision: 0,
@@ -485,6 +672,10 @@ impl AetherStateMachine {
                     version: 0,
                     lease: id,
                 },
+            };
+            let _ = self.watch_tx.send(WatchEvent {
+                event_type: super::WatchEventType::Delete,
+                kv,
                 prev_kv: None,
             });
         }
@@ -906,51 +1097,28 @@ impl AetherStateMachine {
             }
         };
 
-        // Create or update root user with the provided password
-        if let Some(mut root_user) = self.auth_cache.get_user(&root_name) {
-            // Root exists — update password hash
+        // Create or update root user, then enable auth — all in one atomic batch.
+        let root_user = if let Some(mut root_user) = self.auth_cache.get_user(&root_name) {
             root_user.password_hash = password_hash;
-            let key = crate::auth::user_key(&root_name);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&root_user);
-            match bytes {
-                Ok(b) => {
-                    if let Err(e) = self.storage.put(&key, b.as_ref()) {
-                        return RaftResponse::Error {
-                            message: format!("storage write failed: {e}"),
-                        };
-                    }
-                    self.auth_cache.insert_user(root_user);
-                }
-                Err(e) => {
-                    return RaftResponse::Error {
-                        message: format!("serialize failed: {e}"),
-                    };
-                }
-            }
+            root_user
         } else {
-            // Root doesn't exist — create it
             let mut root_user = crate::auth::User::new(root_name.clone(), password_hash);
             root_user.enabled = true;
-            let key = crate::auth::user_key(&root_name);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::BoxedError>(&root_user);
-            match bytes {
-                Ok(b) => {
-                    if let Err(e) = self.storage.put(&key, b.as_ref()) {
-                        return RaftResponse::Error {
-                            message: format!("storage write failed: {e}"),
-                        };
-                    }
-                    self.auth_cache.insert_user(root_user);
-                }
-                Err(e) => {
-                    return RaftResponse::Error {
-                        message: format!("serialize failed: {e}"),
-                    };
-                }
+            root_user
+        };
+
+        let user_key = crate::auth::user_key(&root_name);
+        let user_bytes = match rkyv::to_bytes::<rkyv::rancor::BoxedError>(&root_user) {
+            Ok(b) => b,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("serialize failed: {e}"),
+                };
             }
-        }
+        };
 
         let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(self.storage.default_cf(), &user_key, user_bytes.as_ref());
         batch.put_cf(
             self.storage.default_cf(),
             crate::auth::AUTH_ENABLED_KEY,
@@ -966,7 +1134,8 @@ impl AetherStateMachine {
                 message: format!("storage write failed: {e}"),
             };
         }
-        // Update the shared auth_enabled flag so the interceptor takes effect immediately
+        // Update in-memory state after successful atomic write.
+        self.auth_cache.insert_user(root_user);
         self.auth_enabled.store(true, Ordering::Release);
         RaftResponse::AuthEnable {}
     }
@@ -987,14 +1156,15 @@ impl AetherStateMachine {
     }
 
     /// Apply a normal entry's data (after request_id prefix) for raft-rs.
+    /// `revision` is the Raft log entry index, used as the MVCC global revision.
     /// Returns serialized RaftResponse, or an error string on deserialization failure.
-    pub fn apply_normal_entry(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn apply_normal_entry(&mut self, data: &[u8], revision: u64) -> Result<Vec<u8>, String> {
         let request: RaftRequest = rkyv::from_bytes::<RaftRequest, rkyv::rancor::BoxedError>(data)
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to deserialize RaftRequest");
                 format!("deserialize failed: {e}")
             })?;
-        let response = self.apply_request(request);
+        let response = self.apply_request(request, revision);
         rkyv::to_bytes::<rkyv::rancor::BoxedError>(&response)
             .map(|b| b.into_vec())
             .map_err(|e| format!("serialize failed: {e}"))
@@ -1048,7 +1218,7 @@ mod tests {
             value: b"val1".to_vec(),
             lease_id: 0,
         };
-        let resp = sm.apply_request(req);
+        let resp = sm.apply_request(req, 1);
         match resp {
             RaftResponse::Put { prev_kv } => assert!(prev_kv.is_none()),
             other => panic!("expected Put response, got: {other:?}"),
@@ -1062,17 +1232,23 @@ mod tests {
     fn test_put_returns_prev_kv() {
         let (_dir, _storage, mut sm) = setup();
 
-        sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v1".to_vec(),
-            lease_id: 0,
-        });
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v1".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
 
-        let resp = sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v2".to_vec(),
-            lease_id: 0,
-        });
+        let resp = sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v2".to_vec(),
+                lease_id: 0,
+            },
+            2,
+        );
         match resp {
             RaftResponse::Put { prev_kv } => {
                 let kv = prev_kv.expect("should have prev_kv");
@@ -1087,16 +1263,22 @@ mod tests {
     fn test_delete_single_key() {
         let (_dir, storage, mut sm) = setup();
 
-        sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-            lease_id: 0,
-        });
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
 
-        let resp = sm.apply_request(RaftRequest::Delete {
-            key: b"k".to_vec(),
-            range_end: vec![],
-        });
+        let resp = sm.apply_request(
+            RaftRequest::Delete {
+                key: b"k".to_vec(),
+                range_end: vec![],
+            },
+            2,
+        );
         match resp {
             RaftResponse::Delete { deleted, prev_kvs } => {
                 assert_eq!(deleted, 1);
@@ -1113,10 +1295,13 @@ mod tests {
     fn test_delete_missing_key() {
         let (_dir, _storage, mut sm) = setup();
 
-        let resp = sm.apply_request(RaftRequest::Delete {
-            key: b"missing".to_vec(),
-            range_end: vec![],
-        });
+        let resp = sm.apply_request(
+            RaftRequest::Delete {
+                key: b"missing".to_vec(),
+                range_end: vec![],
+            },
+            1,
+        );
         match resp {
             RaftResponse::Delete { deleted, prev_kvs } => {
                 assert_eq!(deleted, 0);
@@ -1130,12 +1315,15 @@ mod tests {
     fn test_member_add_passthrough() {
         let (_dir, _storage, mut sm) = setup();
 
-        let resp = sm.apply_request(RaftRequest::MemberAdd {
-            member: raft::RaftNode {
-                addr: "127.0.0.1:2380".to_string(),
-                data: String::new(),
+        let resp = sm.apply_request(
+            RaftRequest::MemberAdd {
+                member: raft::RaftNode {
+                    addr: "127.0.0.1:2380".to_string(),
+                    data: String::new(),
+                },
             },
-        });
+            1,
+        );
         match resp {
             RaftResponse::MemberAdd { member } => {
                 assert_eq!(member.addr, "127.0.0.1:2380");
@@ -1148,7 +1336,7 @@ mod tests {
     fn test_member_remove_passthrough() {
         let (_dir, _storage, mut sm) = setup();
 
-        let resp = sm.apply_request(RaftRequest::MemberRemove { node_id: 2 });
+        let resp = sm.apply_request(RaftRequest::MemberRemove { node_id: 2 }, 1);
         match resp {
             RaftResponse::MemberRemove {} => {}
             other => panic!("expected MemberRemove response, got: {other:?}"),
@@ -1168,7 +1356,7 @@ mod tests {
             .unwrap()
             .into_vec();
 
-        let resp_bytes = sm.apply_normal_entry(&data).unwrap();
+        let resp_bytes = sm.apply_normal_entry(&data, 1).unwrap();
         let resp: RaftResponse =
             rkyv::from_bytes::<RaftResponse, rkyv::rancor::BoxedError>(&resp_bytes).unwrap();
         match resp {
@@ -1196,11 +1384,14 @@ mod tests {
             auth_enabled,
         );
 
-        sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-            lease_id: 42,
-        });
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 42,
+            },
+            1,
+        );
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.event_type, WatchEventType::Put);
@@ -1228,17 +1419,23 @@ mod tests {
             auth_enabled,
         );
 
-        sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-            lease_id: 0,
-        });
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
         let _ = rx.try_recv(); // consume put event
 
-        sm.apply_request(RaftRequest::Delete {
-            key: b"k".to_vec(),
-            range_end: vec![],
-        });
+        sm.apply_request(
+            RaftRequest::Delete {
+                key: b"k".to_vec(),
+                range_end: vec![],
+            },
+            2,
+        );
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.event_type, WatchEventType::Delete);
@@ -1249,10 +1446,13 @@ mod tests {
     fn test_lease_grant_and_revoke() {
         let (_dir, _storage, mut sm) = setup();
 
-        let resp = sm.apply_request(RaftRequest::LeaseGrant {
-            ttl: 10,
-            expiry_time: now_millis() + 10_000,
-        });
+        let resp = sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 10,
+                expiry_time: now_millis() + 10_000,
+            },
+            1,
+        );
         match resp {
             RaftResponse::LeaseGrant { id, ttl } => {
                 assert_eq!(id, 1);
@@ -1261,7 +1461,7 @@ mod tests {
             other => panic!("expected LeaseGrant, got: {other:?}"),
         }
 
-        let resp = sm.apply_request(RaftRequest::LeaseRevoke { id: 1 });
+        let resp = sm.apply_request(RaftRequest::LeaseRevoke { id: 1 }, 2);
         match resp {
             RaftResponse::LeaseRevoke {} => {}
             other => panic!("expected LeaseRevoke, got: {other:?}"),
@@ -1272,15 +1472,21 @@ mod tests {
     fn test_lease_keep_alive() {
         let (_dir, _storage, mut sm) = setup();
 
-        sm.apply_request(RaftRequest::LeaseGrant {
-            ttl: 10,
-            expiry_time: now_millis() + 10_000,
-        });
+        sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 10,
+                expiry_time: now_millis() + 10_000,
+            },
+            1,
+        );
 
-        let resp = sm.apply_request(RaftRequest::LeaseKeepAlive {
-            id: 1,
-            expiry_time: now_millis() + 20_000,
-        });
+        let resp = sm.apply_request(
+            RaftRequest::LeaseKeepAlive {
+                id: 1,
+                expiry_time: now_millis() + 20_000,
+            },
+            2,
+        );
         match resp {
             RaftResponse::LeaseKeepAlive { ttl } => assert_eq!(ttl, 10),
             other => panic!("expected LeaseKeepAlive, got: {other:?}"),
@@ -1291,16 +1497,22 @@ mod tests {
     fn test_put_with_lease_attach() {
         let (_dir, _storage, mut sm) = setup();
 
-        sm.apply_request(RaftRequest::LeaseGrant {
-            ttl: 10,
-            expiry_time: now_millis() + 10_000,
-        });
+        sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 10,
+                expiry_time: now_millis() + 10_000,
+            },
+            1,
+        );
 
-        sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-            lease_id: 1,
-        });
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 1,
+            },
+            2,
+        );
 
         assert!(
             sm.lease_manager
@@ -1319,17 +1531,23 @@ mod tests {
     fn test_revoke_deletes_attached_keys() {
         let (_dir, storage, mut sm) = setup();
 
-        sm.apply_request(RaftRequest::LeaseGrant {
-            ttl: 10,
-            expiry_time: now_millis() + 10_000,
-        });
-        sm.apply_request(RaftRequest::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-            lease_id: 1,
-        });
+        sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 10,
+                expiry_time: now_millis() + 10_000,
+            },
+            1,
+        );
+        sm.apply_request(
+            RaftRequest::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease_id: 1,
+            },
+            2,
+        );
 
-        sm.apply_request(RaftRequest::LeaseRevoke { id: 1 });
+        sm.apply_request(RaftRequest::LeaseRevoke { id: 1 }, 3);
 
         assert_eq!(storage.get(b"k").unwrap(), None);
         assert!(sm.lease_manager.lock().unwrap().get(1).is_none());

@@ -37,4 +37,10 @@ pub enum StorageError {
 
     #[error("write batch error: {0}")]
     WriteBatch(String),
+
+    #[error("revision not found: {revision}")]
+    RevisionNotFound { revision: u64 },
+
+    #[error("revision compacted: requested {revision}, compacted to {compacted}")]
+    RevisionCompacted { revision: u64, compacted: u64 },
 }
