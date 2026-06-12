@@ -98,6 +98,36 @@ impl RocksStorage {
         self.db.write(batch).map_err(StorageError::RocksDb)?;
         Ok(())
     }
+
+    /// Defragment user data column families.
+    /// Reclaims disk space by rewriting SST files for `default` and `mvcc` only.
+    /// Internal CFs (raft_log, raft_state, meta, lease, etc.) are not compacted
+    /// because they are small and managed by snapshot/compaction policies.
+    pub fn defrag(&self) -> Result<(), StorageError> {
+        for cf_name in &["default", "mvcc"] {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the total SST file size in bytes (actual disk usage).
+    pub fn approximate_size(&self) -> i64 {
+        self.db
+            .property_int_value("rocksdb.total-sst-files-size")
+            .unwrap_or(None)
+            .unwrap_or(0) as i64
+    }
+
+    /// Return the estimated live data size in bytes (excludes obsolete entries
+    /// and deleted keys still in SST files).
+    pub fn approximate_mem_usage(&self) -> i64 {
+        self.db
+            .property_int_value("rocksdb.estimate-live-data-size")
+            .unwrap_or(None)
+            .unwrap_or(0) as i64
+    }
 }
 
 impl StorageEngine for RocksStorage {

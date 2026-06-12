@@ -59,6 +59,8 @@ pub struct ReadIndexRequest {
 /// Shared state between the event loop and RaftHandleImpl.
 pub struct RaftSharedState {
     pub leader_id: AtomicU64,
+    /// Current Raft term.
+    pub term: AtomicU64,
     /// Last committed index seen by the event loop (for ReadIndex).
     pub commit_index: AtomicU64,
     /// Last applied index (updated after state machine apply, for ReadIndex wait).
@@ -71,6 +73,7 @@ impl Default for RaftSharedState {
     fn default() -> Self {
         Self {
             leader_id: AtomicU64::new(0),
+            term: AtomicU64::new(0),
             commit_index: AtomicU64::new(0),
             applied_index: AtomicU64::new(0),
             applied_notify: Notify::new(),
@@ -406,6 +409,7 @@ fn raft_event_loop(
             shared_state
                 .leader_id
                 .store(node.raft.leader_id, Ordering::Relaxed);
+            shared_state.term.store(node.raft.term, Ordering::Relaxed);
             continue;
         }
 
@@ -567,6 +571,7 @@ fn raft_event_loop(
             shared_state
                 .leader_id
                 .store(node.raft.leader_id, Ordering::Relaxed);
+            shared_state.term.store(node.raft.term, Ordering::Relaxed);
 
             node.advance(ready);
         }
