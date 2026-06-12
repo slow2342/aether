@@ -10,15 +10,18 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 use aether::api::health::HealthStatus;
 use aether::api::metrics::{MetricsLayer, MetricsRegistry};
 use aether::api::{
-    AuthService, ClusterService, KvService, LeaseService, ShardService, WatchService,
+    AuthService, ClusterService, KvService, LeaseService, MaintenanceService, ShardService,
+    WatchService,
 };
 use aether::auth::AuthLayer;
+use aether::cluster::AlarmManager;
 use aether::config::{AetherConfig, LogConfig};
 use aether::lease::{LeaseManager, LeaseStore};
 use aether::proto::aether_auth_server::AetherAuthServer;
 use aether::proto::aether_cluster_server::AetherClusterServer;
 use aether::proto::aether_kv_server::AetherKvServer;
 use aether::proto::aether_lease_server::AetherLeaseServer;
+use aether::proto::aether_maintenance_server::AetherMaintenanceServer;
 use aether::proto::aether_shard_server::AetherShardServer;
 use aether::proto::aether_watch_server::AetherWatchServer;
 use aether::proto::raft_rpc::raft_rpc_server::RaftRpcServer;
@@ -379,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let auth_enabled_for_api = auth_enabled.clone();
+    let storage_for_maintenance = storage.clone();
     let kv_service = KvService::new(
         storage,
         raft_handle.clone(),
@@ -389,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
     let cluster_service =
         ClusterService::new(raft_handle.clone(), config.node_id, auth_enabled.clone());
     let auth_enabled_for_shard = auth_enabled.clone();
+    let auth_enabled_for_maintenance = auth_enabled.clone();
     let lease_service = LeaseService::new(
         raft_handle.clone(),
         config.node_id,
@@ -412,6 +417,15 @@ async fn main() -> anyhow::Result<()> {
         config.node_id,
         auth_enabled_for_shard,
         shard_manager_for_api,
+    );
+
+    let alarm_manager = Arc::new(AlarmManager::new());
+    let maintenance_service = MaintenanceService::new(
+        raft_handle.clone(),
+        storage_for_maintenance,
+        alarm_manager,
+        config.node_id,
+        auth_enabled_for_maintenance,
     );
 
     // Create RPC server (receives messages from other nodes)
@@ -530,6 +544,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(AetherWatchServer::new(watch_service))
         .add_service(AetherLeaseServer::new(lease_service))
         .add_service(AetherClusterServer::new(cluster_service))
+        .add_service(AetherMaintenanceServer::new(maintenance_service))
         .add_service(AetherShardServer::new(shard_service))
         .add_service(RaftRpcServer::new(raft_rpc_service))
         .serve(addr)

@@ -97,6 +97,12 @@ impl RaftHandle for RaftRsHandle {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn term(&self) -> u64 {
+        self.shared_state
+            .term
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn wait_for_apply(&self) {
         self.shared_state.applied_notify.notified().await;
     }

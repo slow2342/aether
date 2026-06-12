@@ -45,6 +45,9 @@ pub trait RaftHandle: Send + Sync + 'static {
     /// Return the last applied index of the state machine.
     fn applied_index(&self) -> u64;
 
+    /// Return the current Raft term.
+    fn term(&self) -> u64;
+
     /// Wait until applied_index may have changed. Used by linearizable_read
     /// to avoid polling.
     async fn wait_for_apply(&self);
@@ -172,6 +175,9 @@ mod tests {
         }
         fn applied_index(&self) -> u64 {
             self.applied_idx.load(Ordering::Relaxed)
+        }
+        fn term(&self) -> u64 {
+            0
         }
         async fn wait_for_apply(&self) {
             // No-op in mock.
@@ -359,6 +365,9 @@ mod tests {
             0
         }
         fn applied_index(&self) -> u64 {
+            0
+        }
+        fn term(&self) -> u64 {
             0
         }
         async fn wait_for_apply(&self) {}

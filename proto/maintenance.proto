@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherMaintenance provides operational tools for cluster maintenance.
+service AetherMaintenance {
+    // Defrag triggers storage defragmentation on the receiving node.
+    rpc Defrag(DefragRequest) returns (DefragResponse);
+
+    // Alarm manages cluster-wide alarms (e.g. space quota, corruption).
+    rpc Alarm(AlarmRequest) returns (AlarmResponse);
+
+    // Status returns node-level status information.
+    rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// AlarmType identifies the type of alarm.
+enum AlarmType {
+    ALARM_TYPE_NONE = 0;
+    // Space quota has been exceeded.
+    ALARM_TYPE_NOSPACE = 1;
+    // Storage corruption detected.
+    ALARM_TYPE_CORRUPT = 2;
+}
+
+// AlarmMember associates an alarm with a cluster member.
+message AlarmMember {
+    // member_id is the ID of the member raising the alarm.
+    uint64 member_id = 1;
+    // alarm is the type of alarm.
+    AlarmType alarm = 2;
+}
+
+// AlarmAction defines the operation to perform on alarms.
+enum AlarmAction {
+    ALARM_ACTION_GET = 0;
+    ALARM_ACTION_ACTIVATE = 1;
+    ALARM_ACTION_ACKNOWLEDGE = 2;
+}
+
+message DefragRequest {}
+
+message DefragResponse {
+    ResponseHeader header = 1;
+}
+
+message AlarmRequest {
+    // action is the operation to perform.
+    AlarmAction action = 1;
+    // alarm is the alarm type (used for ACTIVATE and ACKNOWLEDGE).
+    AlarmType alarm = 2;
+    // member_id is the target member (0 = self, used for ACKNOWLEDGE).
+    uint64 member_id = 3;
+}
+
+message AlarmResponse {
+    ResponseHeader header = 1;
+    // alarms is the list of active alarms (populated on GET).
+    repeated AlarmMember alarms = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+    ResponseHeader header = 1;
+    // version is the Aether server version.
+    string version = 2;
+    // db_size is the total SST file size in bytes (disk usage).
+    int64 db_size = 3;
+    // leader is the current Raft leader node ID.
+    uint64 leader = 4;
+    // raft_index is the current Raft commit index.
+    uint64 raft_index = 5;
+    // raft_term is the current Raft term.
+    uint64 raft_term = 6;
+    // raft_applied_index is the last applied Raft index.
+    uint64 raft_applied_index = 7;
+    // db_in_use is the estimated live data size in bytes.
+    int64 db_in_use = 8;
+    // is_learner indicates if this node is a learner.
+    bool is_learner = 9;
+}
