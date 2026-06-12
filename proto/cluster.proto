@@ -14,6 +14,9 @@ service AetherCluster {
 
     // MemberRemove removes a member from the cluster.
     rpc MemberRemove(MemberRemoveRequest) returns (MemberRemoveResponse);
+
+    // MemberPromote promotes a learner member to a voting member.
+    rpc MemberPromote(MemberPromoteRequest) returns (MemberPromoteResponse);
 }
 
 // Member represents a cluster member.
@@ -50,6 +53,16 @@ message MemberRemoveRequest {
 }
 
 message MemberRemoveResponse {
+    ResponseHeader header = 1;
+    repeated Member members = 2;
+}
+
+message MemberPromoteRequest {
+    // id is the node ID of the learner to promote to voter.
+    uint64 id = 1;
+}
+
+message MemberPromoteResponse {
     ResponseHeader header = 1;
     repeated Member members = 2;
 }

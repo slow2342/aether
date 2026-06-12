@@ -6,7 +6,7 @@ pub mod raftrs_store;
 pub mod rpc;
 pub mod state_machine;
 
-pub use self::handle::{RaftError, RaftHandle, ensure_linearizable, require_leader};
+pub use self::handle::{MemberInfo, RaftError, RaftHandle, ensure_linearizable, require_leader};
 
 /// Node identifier type
 pub type NodeId = u64;

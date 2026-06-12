@@ -211,8 +211,8 @@ impl AetherLease for LeaseService {
                                 if let Some(addr) = raft
                                     .members()
                                     .into_iter()
-                                    .find(|(id, _)| Some(*id) == raft.leader_id())
-                                    .map(|(_, addr)| addr)
+                                    .find(|m| Some(m.id) == raft.leader_id())
+                                    .map(|m| m.addr)
                                 {
                                     let mut metadata = tonic::metadata::MetadataMap::new();
                                     if let Ok(val) = addr.parse() {

@@ -6,7 +6,7 @@ use raft::eraftpb::{ConfChange, ConfChangeType};
 use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
-use super::handle::{RaftError, RaftHandle};
+use super::handle::{MemberInfo, RaftError, RaftHandle};
 use super::node::{ConfChangeRequest, ProposeRequest, RaftSharedState, ReadIndexRequest};
 use super::{NodeId, RaftRequest, RaftResponse};
 
@@ -21,7 +21,7 @@ pub struct RaftRsHandle {
     // Uses std::sync::RwLock (not tokio::sync::RwLock) because members() is a
     // sync method on the trait, and write operations (add_learner, change_membership)
     // only hold the lock during synchronous mutations — no .await while guarded.
-    members: RwLock<Vec<(u64, String)>>,
+    members: RwLock<Vec<MemberInfo>>,
     read_index_counter: AtomicU64,
 }
 
@@ -31,8 +31,17 @@ impl RaftRsHandle {
         conf_change_tx: mpsc::Sender<ConfChangeRequest>,
         read_index_tx: mpsc::Sender<ReadIndexRequest>,
         shared_state: Arc<RaftSharedState>,
-        members: Vec<(u64, String)>,
+        initial_peers: Vec<(u64, String)>,
     ) -> Self {
+        // Bootstrap peers are all voters.
+        let members = initial_peers
+            .into_iter()
+            .map(|(id, addr)| MemberInfo {
+                id,
+                addr,
+                is_learner: false,
+            })
+            .collect();
         Self {
             propose_tx,
             conf_change_tx,
@@ -104,11 +113,21 @@ impl RaftHandle for RaftRsHandle {
         rx.await.map_err(|_| RaftError::ChannelClosed)?
     }
 
-    fn members(&self) -> Vec<(u64, String)> {
+    fn members(&self) -> Vec<MemberInfo> {
         self.members.read().unwrap().clone()
     }
 
     async fn add_learner(&self, id: u64, addr: String) -> Result<(), RaftError> {
+        // Reject if the node is already a member (voter or learner).
+        {
+            let members = self.members.read().unwrap();
+            if members.iter().any(|m| m.id == id) {
+                return Err(RaftError::Internal(format!(
+                    "node {id} is already a cluster member"
+                )));
+            }
+        }
+
         let mut cc = ConfChange::default();
         cc.set_change_type(ConfChangeType::AddLearnerNode);
         cc.node_id = id;
@@ -122,7 +141,29 @@ impl RaftHandle for RaftRsHandle {
         rx.await.map_err(|_| RaftError::ChannelClosed)??;
 
         // Update local member list so require_leader can find the new node's address.
-        self.members.write().unwrap().push((id, addr));
+        self.members.write().unwrap().push(MemberInfo {
+            id,
+            addr,
+            is_learner: true,
+        });
+        Ok(())
+    }
+
+    async fn remove_node(&self, id: u64) -> Result<(), RaftError> {
+        let mut cc = ConfChange::default();
+        cc.set_change_type(ConfChangeType::RemoveNode);
+        cc.node_id = id;
+
+        let (tx, rx) = oneshot::channel();
+        self.conf_change_tx
+            .send(ConfChangeRequest { cc, tx })
+            .await
+            .map_err(|_| RaftError::ChannelClosed)?;
+
+        rx.await.map_err(|_| RaftError::ChannelClosed)??;
+
+        // Remove from local member list.
+        self.members.write().unwrap().retain(|m| m.id != id);
         Ok(())
     }
 
@@ -132,7 +173,8 @@ impl RaftHandle for RaftRsHandle {
             .read()
             .unwrap()
             .iter()
-            .map(|(id, _)| *id)
+            .filter(|m| !m.is_learner)
+            .map(|m| m.id)
             .collect();
 
         let to_add: Vec<u64> = voters
@@ -173,14 +215,21 @@ impl RaftHandle for RaftRsHandle {
             rx.await.map_err(|_| RaftError::ChannelClosed)??;
         }
 
-        // Update local member list: add new voters, remove old ones.
+        // Update local member list: add new voters, promote learners, remove old ones.
         let mut members = self.members.write().unwrap();
         for node_id in to_add {
-            if !members.iter().any(|(id, _)| *id == node_id) {
-                members.push((node_id, String::new()));
+            if let Some(m) = members.iter_mut().find(|m| m.id == node_id) {
+                // Promote existing learner to voter.
+                m.is_learner = false;
+            } else {
+                members.push(MemberInfo {
+                    id: node_id,
+                    addr: String::new(),
+                    is_learner: false,
+                });
             }
         }
-        members.retain(|(id, _)| voters.contains(id));
+        members.retain(|m| voters.contains(&m.id));
         Ok(())
     }
 }
