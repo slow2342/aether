@@ -10,16 +10,18 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 use aether::api::health::HealthStatus;
 use aether::api::metrics::{MetricsLayer, MetricsRegistry};
 use aether::api::{
-    AuthService, ClusterService, KvService, LeaseService, LockService, MaintenanceService,
-    ShardService, WatchService,
+    AuthService, ClusterService, ElectionService, KvService, LeaseService, LockService,
+    MaintenanceService, ShardService, WatchService,
 };
 use aether::auth::AuthLayer;
 use aether::cluster::AlarmManager;
 use aether::config::{AetherConfig, LogConfig};
+use aether::election::ElectionManager;
 use aether::lease::{LeaseManager, LeaseStore};
 use aether::lock::LockManager;
 use aether::proto::aether_auth_server::AetherAuthServer;
 use aether::proto::aether_cluster_server::AetherClusterServer;
+use aether::proto::aether_election_server::AetherElectionServer;
 use aether::proto::aether_kv_server::AetherKvServer;
 use aether::proto::aether_lease_server::AetherLeaseServer;
 use aether::proto::aether_lock_server::AetherLockServer;
@@ -305,6 +307,10 @@ async fn main() -> anyhow::Result<()> {
     let lock_manager = Arc::new(Mutex::new(LockManager::new()));
     let lock_manager_for_api = lock_manager.clone();
 
+    // Create election manager (shared between state machine and API layer)
+    let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
+    let election_manager_for_api = election_manager.clone();
+
     let state_machine = Arc::new(Mutex::new(AetherStateMachine::new(
         watch_tx.clone(),
         storage.clone(),
@@ -314,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
         auth_enabled.clone(),
         shard_manager,
         lock_manager,
+        election_manager,
     )));
     // auth_enabled is cloned above; keep a reference for ClusterService below
 
@@ -373,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
     // Create services
     let watch_manager = WatchManager::new(watch_tx);
     let watch_manager_for_metrics = watch_manager.clone();
+    let watch_manager_for_election = watch_manager.clone();
     let watch_service = WatchService::new(
         watch_manager,
         auth_enabled.clone(),
@@ -390,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
 
     let auth_enabled_for_api = auth_enabled.clone();
     let storage_for_maintenance = storage.clone();
+    let storage_for_election = storage.clone();
     let kv_service = KvService::new(
         storage,
         raft_handle.clone(),
@@ -427,6 +436,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let lock_service = LockService::new(raft_handle.clone(), config.node_id, lock_manager_for_api);
+
+    let election_service = ElectionService::new(
+        raft_handle.clone(),
+        config.node_id,
+        election_manager_for_api,
+        storage_for_election,
+        watch_manager_for_election,
+    );
 
     let alarm_manager = Arc::new(AlarmManager::new());
     let maintenance_service = MaintenanceService::new(
@@ -553,6 +570,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(AetherWatchServer::new(watch_service))
         .add_service(AetherLeaseServer::new(lease_service))
         .add_service(AetherLockServer::new(lock_service))
+        .add_service(AetherElectionServer::new(election_service))
         .add_service(AetherClusterServer::new(cluster_service))
         .add_service(AetherMaintenanceServer::new(maintenance_service))
         .add_service(AetherShardServer::new(shard_service))

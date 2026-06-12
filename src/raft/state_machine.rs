@@ -6,6 +6,7 @@ use rocksdb::WriteBatch;
 
 use super::{KeyValue, RaftRequest, RaftResponse, WatchEvent};
 use crate::auth::AuthCache;
+use crate::election::ElectionManager;
 use crate::lease::{LeaseManager, LeaseStore};
 use crate::lock::LockManager;
 use crate::shard::manager::ShardManager;
@@ -81,6 +82,8 @@ pub struct AetherStateMachine {
     pub shard_manager: Arc<Mutex<ShardManager>>,
     /// In-memory lock manager (shared with API layer).
     pub lock_manager: Arc<Mutex<LockManager>>,
+    /// In-memory election manager (shared with API layer).
+    pub election_manager: Arc<Mutex<ElectionManager>>,
 }
 
 /// Captures pre-mutation in-memory state for keys touched during an apply.
@@ -200,6 +203,7 @@ impl AetherStateMachine {
         auth_enabled: Arc<AtomicBool>,
         shard_manager: Arc<Mutex<ShardManager>>,
         lock_manager: Arc<Mutex<LockManager>>,
+        election_manager: Arc<Mutex<ElectionManager>>,
     ) -> Self {
         let key_indexes = load_key_indexes(storage.db(), storage.mvcc_cf())
             .expect("failed to load key indexes from mvcc CF");
@@ -211,6 +215,14 @@ impl AetherStateMachine {
             let mut mgr = lock_manager.lock().unwrap();
             if let Err(e) = mgr.restore(&storage) {
                 tracing::error!(error = %e, "failed to restore lock state from storage");
+            }
+        }
+
+        // Restore election state from persistent storage
+        {
+            let mut mgr = election_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&storage) {
+                tracing::error!(error = %e, "failed to restore election state from storage");
             }
         }
 
@@ -227,6 +239,7 @@ impl AetherStateMachine {
             key_leases,
             shard_manager,
             lock_manager,
+            election_manager,
         }
     }
 
@@ -1010,6 +1023,14 @@ impl AetherStateMachine {
                 self.apply_lock_acquire(name, lease_id, revision)
             }
             RaftRequest::LockRelease { key } => self.apply_lock_release(key, revision),
+            RaftRequest::ElectionCampaign {
+                name,
+                lease_id,
+                value,
+            } => self.apply_election_campaign(name, lease_id, value, revision),
+            RaftRequest::ElectionResign { leader_key } => {
+                self.apply_election_resign(leader_key, revision)
+            }
         }
     }
 
@@ -1126,6 +1147,9 @@ impl AetherStateMachine {
 
         // Release all locks associated with this lease (before checking if lease exists)
         self.apply_lock_release_by_lease(id);
+
+        // Release all elections associated with this lease
+        self.apply_election_release_by_lease(id);
 
         // If no user-data keys and lease already gone, this is an idempotent no-op.
         if key_values.is_empty() {
@@ -1861,6 +1885,134 @@ impl AetherStateMachine {
         );
     }
 
+    fn apply_election_campaign(
+        &mut self,
+        name: Vec<u8>,
+        lease_id: i64,
+        value: Vec<u8>,
+        _revision: u64,
+    ) -> RaftResponse {
+        let key = crate::election::election_key(&name);
+
+        // Check if election already has a leader
+        {
+            let mgr = self.election_manager.lock().unwrap();
+            if let Some(current_leader_key) = mgr.get_leader_key(&name) {
+                return RaftResponse::ElectionAlreadyHasLeader {
+                    current_leader_key: current_leader_key.to_vec(),
+                };
+            }
+        }
+
+        // Store the election key in the KV store with lease_id and value
+        // Value format: [lease_id: i64 BE][value_bytes]
+        let encoded_value = crate::election::ElectionManager::encode_value(&value, lease_id);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.storage.default_cf(), &key, &encoded_value);
+
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to persist election: {e}"),
+            };
+        }
+
+        // Update in-memory election manager (after successful KV write)
+        {
+            let mut mgr = self.election_manager.lock().unwrap();
+            mgr.set_leader(name, key.clone(), lease_id);
+        }
+
+        tracing::debug!(
+            election = %String::from_utf8_lossy(&key),
+            lease_id = lease_id,
+            "election campaign successful"
+        );
+
+        RaftResponse::ElectionCampaign { leader_key: key }
+    }
+
+    fn apply_election_resign(&mut self, leader_key: Vec<u8>, _revision: u64) -> RaftResponse {
+        // Validate election key format
+        if crate::election::election_name(&leader_key).is_none() {
+            return RaftResponse::Error {
+                message: "invalid election key".to_string(),
+            };
+        }
+
+        // Check if the leader key exists in memory
+        {
+            let mgr = self.election_manager.lock().unwrap();
+            if mgr.get_election_name_by_key(&leader_key).is_none() {
+                return RaftResponse::ElectionResignNotFound {};
+            }
+        }
+
+        // Remove from KV store
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(self.storage.default_cf(), &leader_key);
+
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to delete election key: {e}"),
+            };
+        }
+
+        // Update in-memory election manager (after successful KV delete)
+        let mut mgr = self.election_manager.lock().unwrap();
+        mgr.remove_leader(&leader_key);
+
+        tracing::debug!(
+            election = %String::from_utf8_lossy(&leader_key),
+            "election resigned"
+        );
+
+        RaftResponse::ElectionResign {}
+    }
+
+    /// Release all elections associated with a lease.
+    /// Called when a lease is revoked or expires.
+    fn apply_election_release_by_lease(&mut self, lease_id: i64) {
+        // First, collect the keys to release from memory (without removing them yet)
+        let keys_to_release: Vec<Vec<u8>> = {
+            let mgr = self.election_manager.lock().unwrap();
+            let keys = mgr.get_keys_by_lease(lease_id);
+            tracing::debug!(
+                lease_id = lease_id,
+                election_count = mgr.election_count(),
+                keys_found = keys.len(),
+                "collecting elections for lease release"
+            );
+            keys
+        };
+
+        if keys_to_release.is_empty() {
+            return;
+        }
+
+        // Delete election keys from KV store first
+        let mut batch = WriteBatch::default();
+        for key in &keys_to_release {
+            batch.delete_cf(self.storage.default_cf(), key);
+        }
+
+        if let Err(e) = self.storage.db().write(batch) {
+            tracing::error!(error = %e, lease_id = lease_id, "failed to delete election keys for lease");
+            return; // Don't update memory if KV delete failed
+        }
+
+        // Now remove from memory (after successful KV delete)
+        {
+            let mut mgr = self.election_manager.lock().unwrap();
+            mgr.remove_by_lease(lease_id);
+        }
+
+        tracing::debug!(
+            lease_id = lease_id,
+            count = keys_to_release.len(),
+            "released elections for lease"
+        );
+    }
+
     /// Maximum allowed snapshot size (512 MiB).  Prevents OOM when the database
     /// is larger than available memory.  The serialized snapshot is typically
     /// 1-2x the raw CF data size, so this limits total memory to ~1.5 GiB.
@@ -2011,11 +2163,20 @@ impl AetherStateMachine {
             }
         }
 
+        // Rebuild election manager from persisted election data.
+        {
+            let mut mgr = self.election_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&self.storage) {
+                tracing::warn!(error = %e, "failed to restore election manager from snapshot");
+            }
+        }
+
         self.last_applied = applied_index;
         tracing::info!(
             applied_index,
             keys = self.key_metas.len(),
             locks = self.lock_manager.lock().unwrap().lock_count(),
+            elections = self.election_manager.lock().unwrap().election_count(),
             "restored from snapshot"
         );
         Ok(())
@@ -2101,6 +2262,7 @@ impl AetherStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::election::ElectionManager;
     use crate::lease::now_millis;
     use crate::raft::{self, WatchEventType};
     use tempfile::tempdir;
@@ -2116,6 +2278,7 @@ mod tests {
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
         let sm = AetherStateMachine::new(
             tx.clone(),
             storage.clone(),
@@ -2125,6 +2288,7 @@ mod tests {
             auth_enabled,
             shard_manager,
             lock_manager,
+            election_manager,
         );
         (dir, storage, sm)
     }
@@ -2294,6 +2458,7 @@ mod tests {
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2303,6 +2468,7 @@ mod tests {
             auth_enabled,
             shard_manager,
             lock_manager,
+            election_manager,
         );
 
         sm.apply_request(
@@ -2333,6 +2499,7 @@ mod tests {
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2342,6 +2509,7 @@ mod tests {
             auth_enabled,
             shard_manager,
             lock_manager,
+            election_manager,
         );
 
         sm.apply_request(
@@ -2593,6 +2761,7 @@ mod tests {
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2602,6 +2771,7 @@ mod tests {
             auth_enabled,
             shard_manager,
             lock_manager,
+            election_manager,
         );
 
         sm.apply_request(
@@ -3457,6 +3627,7 @@ mod tests {
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3466,6 +3637,7 @@ mod tests {
             auth_enabled2,
             shard_manager2,
             lock_manager2,
+            election_manager2,
         );
 
         // Write different data to sm2 to verify it gets overwritten.
@@ -3530,6 +3702,7 @@ mod tests {
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3539,6 +3712,7 @@ mod tests {
             auth_enabled2,
             shard_manager2,
             lock_manager2,
+            election_manager2,
         );
 
         sm2.restore_snapshot(&snapshot_data, 2).unwrap();
@@ -3593,6 +3767,7 @@ mod tests {
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3602,6 +3777,7 @@ mod tests {
             auth_enabled2,
             shard_manager2,
             lock_manager2,
+            election_manager2,
         );
 
         // Verify lock exists in fresh state machine (from startup restore).
@@ -3676,6 +3852,7 @@ mod tests {
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
+        let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3685,6 +3862,7 @@ mod tests {
             auth_enabled2,
             shard_manager2,
             lock_manager2,
+            election_manager2,
         );
 
         // Restore from snapshot.

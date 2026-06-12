@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherElection provides distributed leader election operations.
+// Elections are built on top of leases: a campaign creates a key with the
+// given lease, ensuring automatic resignation when the lease expires.
+service AetherElection {
+    // Campaign waits to acquire leadership for the given election name.
+    // The caller becomes the leader and returns the leader key. Other
+    // callers block until the current leader resigns or their lease expires.
+    rpc Campaign(CampaignRequest) returns (CampaignResponse);
+    // Leader returns the current leader of the given election.
+    rpc Leader(LeaderRequest) returns (LeaderResponse);
+    // Resign voluntarily gives up leadership for the given leader key.
+    rpc Resign(ResignRequest) returns (ResignResponse);
+    // Observe streams leadership changes for the given election name.
+    rpc Observe(ObserveRequest) returns (stream ObserveResponse);
+}
+
+message CampaignRequest {
+    // name is the election name to campaign for.
+    bytes name = 1;
+    // lease_id is the lease to associate with the campaign.
+    // The campaign is automatically revoked when the lease expires.
+    int64 lease_id = 2;
+    // value is the value to store with the campaign (typically the
+    // candidate's identity or proposal).
+    bytes value = 3;
+}
+
+message CampaignResponse {
+    ResponseHeader header = 1;
+    // leader_key is the key that identifies this campaign. It can be
+    // used to resign or query leadership.
+    bytes leader_key = 2;
+}
+
+message LeaderRequest {
+    // name is the election name.
+    bytes name = 1;
+}
+
+message LeaderResponse {
+    ResponseHeader header = 1;
+    // kv is the current leader's key-value, empty if no leader.
+    KeyValue kv = 2;
+}
+
+message ResignRequest {
+    // leader_key is the key returned by Campaign.
+    bytes leader_key = 1;
+}
+
+message ResignResponse {
+    ResponseHeader header = 1;
+}
+
+message ObserveRequest {
+    // name is the election name to observe.
+    bytes name = 1;
+}
+
+message ObserveResponse {
+    ResponseHeader header = 1;
+    // kv is the current leader's key-value.
+    KeyValue kv = 2;
+}

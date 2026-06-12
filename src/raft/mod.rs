@@ -87,6 +87,14 @@ pub enum RaftRequest {
     LockAcquire { name: Vec<u8>, lease_id: i64 },
     /// Release a distributed lock
     LockRelease { key: Vec<u8> },
+    /// Campaign for leadership in an election
+    ElectionCampaign {
+        name: Vec<u8>,
+        lease_id: i64,
+        value: Vec<u8>,
+    },
+    /// Resign from leadership in an election
+    ElectionResign { leader_key: Vec<u8> },
 }
 
 /// Raft response types
@@ -135,6 +143,16 @@ pub enum RaftResponse {
         key: Vec<u8>,
     },
     LockRelease {},
+    ElectionCampaign {
+        leader_key: Vec<u8>,
+    },
+    /// Election already has a leader, returns the current leader key
+    ElectionAlreadyHasLeader {
+        current_leader_key: Vec<u8>,
+    },
+    ElectionResign {},
+    /// Election resign requested but leader key not found
+    ElectionResignNotFound {},
     /// Storage error during apply
     Error {
         message: String,
