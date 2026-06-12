@@ -26,6 +26,9 @@ pub struct AetherConfig {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    #[serde(default)]
+    pub shard: ShardConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +201,39 @@ impl Default for MetricsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardConfig {
+    /// Maximum region size in bytes before auto-split triggers.
+    #[serde(default = "default_max_region_size")]
+    pub max_region_size_bytes: u64,
+
+    /// Maximum number of regions.
+    #[serde(default = "default_max_regions")]
+    pub max_regions: usize,
+
+    /// Enable automatic region splitting when size threshold is exceeded.
+    #[serde(default)]
+    pub auto_split: bool,
+}
+
+fn default_max_region_size() -> u64 {
+    64 * 1024 * 1024 // 64 MB
+}
+
+fn default_max_regions() -> usize {
+    1024
+}
+
+impl Default for ShardConfig {
+    fn default() -> Self {
+        Self {
+            max_region_size_bytes: default_max_region_size(),
+            max_regions: default_max_regions(),
+            auto_split: false,
+        }
+    }
+}
+
 impl Default for AetherConfig {
     fn default() -> Self {
         Self {
@@ -209,6 +245,7 @@ impl Default for AetherConfig {
             log: LogConfig::default(),
             lease: LeaseConfig::default(),
             metrics: MetricsConfig::default(),
+            shard: ShardConfig::default(),
         }
     }
 }

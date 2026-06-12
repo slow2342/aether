@@ -7,6 +7,7 @@ use rocksdb::WriteBatch;
 use super::{KeyValue, RaftRequest, RaftResponse, WatchEvent};
 use crate::auth::AuthCache;
 use crate::lease::{LeaseManager, LeaseStore};
+use crate::shard::manager::ShardManager;
 use crate::storage::mvcc::{
     KeyIndex, MvccValue, encode_mvcc_key, load_key_indexes, save_global_revision,
 };
@@ -21,6 +22,7 @@ struct SnapshotCfData {
     lease_entries: Vec<(Vec<u8>, Vec<u8>)>,
     lease_keys_entries: Vec<(Vec<u8>, Vec<u8>)>,
     key_lease_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    region_entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Per-key metadata tracked in memory and persisted to the meta CF.
@@ -74,6 +76,8 @@ pub struct AetherStateMachine {
     /// Tracks the lease_id for each key so that Txn sub-operations can look up
     /// the current lease association without reading uncommitted batch writes.
     pub key_leases: HashMap<Vec<u8>, i64>,
+    /// Shard manager: in-memory index of all regions (shared with API layer).
+    pub shard_manager: Arc<Mutex<ShardManager>>,
 }
 
 /// Captures pre-mutation in-memory state for keys touched during an apply.
@@ -190,6 +194,7 @@ impl AetherStateMachine {
         lease_store: LeaseStore,
         auth_cache: Arc<AuthCache>,
         auth_enabled: Arc<AtomicBool>,
+        shard_manager: Arc<Mutex<ShardManager>>,
     ) -> Self {
         let key_indexes = load_key_indexes(storage.db(), storage.mvcc_cf())
             .expect("failed to load key indexes from mvcc CF");
@@ -206,6 +211,7 @@ impl AetherStateMachine {
             key_indexes,
             key_metas,
             key_leases,
+            shard_manager,
         }
     }
 
@@ -980,6 +986,11 @@ impl AetherStateMachine {
                 self.apply_auth_enable(root_password_hash)
             }
             RaftRequest::AuthDisable {} => self.apply_auth_disable(),
+            RaftRequest::RegionSplit {
+                region_id,
+                split_key,
+            } => self.apply_region_split(region_id, split_key),
+            RaftRequest::RegionUpdate { region } => self.apply_region_update(region),
         }
     }
 
@@ -1630,6 +1641,79 @@ impl AetherStateMachine {
         RaftResponse::AuthDisable {}
     }
 
+    fn apply_region_split(&mut self, region_id: u64, split_key: Vec<u8>) -> RaftResponse {
+        let mut mgr = self.shard_manager.lock().unwrap();
+        let max_regions = mgr.max_regions();
+
+        let (parent, child) = match mgr.apply_split(region_id, split_key) {
+            Ok(result) => result,
+            Err(message) => return RaftResponse::Error { message },
+        };
+
+        let mut batch = WriteBatch::default();
+        if let Err(message) = mgr.save_region_to_batch(&mut batch, &self.storage, &parent) {
+            drop(mgr);
+            let mut mgr = self.shard_manager.lock().unwrap();
+            *mgr = ShardManager::load_from_storage_with_limit(&self.storage, max_regions);
+            return RaftResponse::Error { message };
+        }
+        if let Err(message) = mgr.save_region_to_batch(&mut batch, &self.storage, &child) {
+            drop(mgr);
+            let mut mgr = self.shard_manager.lock().unwrap();
+            *mgr = ShardManager::load_from_storage_with_limit(&self.storage, max_regions);
+            return RaftResponse::Error { message };
+        }
+
+        if let Err(e) = self.storage.db().write(batch) {
+            tracing::error!(error = %e, "failed to persist region split");
+            drop(mgr);
+            let mut mgr = self.shard_manager.lock().unwrap();
+            *mgr = ShardManager::load_from_storage_with_limit(&self.storage, max_regions);
+            return RaftResponse::Error {
+                message: format!("region split write failed: {e}"),
+            };
+        }
+
+        tracing::info!(
+            parent_id = parent.id,
+            child_id = child.id,
+            parent_end = %String::from_utf8_lossy(&parent.end_key),
+            child_start = %String::from_utf8_lossy(&child.start_key),
+            "region split applied"
+        );
+
+        RaftResponse::RegionSplit { parent, child }
+    }
+
+    fn apply_region_update(&mut self, region: crate::shard::Region) -> RaftResponse {
+        let mut mgr = self.shard_manager.lock().unwrap();
+        let max_regions = mgr.max_regions();
+
+        if let Err(message) = mgr.apply_update(region.clone()) {
+            return RaftResponse::Error { message };
+        }
+
+        let mut batch = WriteBatch::default();
+        if let Err(message) = mgr.save_region_to_batch(&mut batch, &self.storage, &region) {
+            drop(mgr);
+            let mut mgr = self.shard_manager.lock().unwrap();
+            *mgr = ShardManager::load_from_storage_with_limit(&self.storage, max_regions);
+            return RaftResponse::Error { message };
+        }
+
+        if let Err(e) = self.storage.db().write(batch) {
+            tracing::error!(error = %e, "failed to persist region update");
+            drop(mgr);
+            let mut mgr = self.shard_manager.lock().unwrap();
+            *mgr = ShardManager::load_from_storage_with_limit(&self.storage, max_regions);
+            return RaftResponse::Error {
+                message: format!("region update write failed: {e}"),
+            };
+        }
+
+        RaftResponse::RegionUpdate {}
+    }
+
     /// Maximum allowed snapshot size (512 MiB).  Prevents OOM when the database
     /// is larger than available memory.  The serialized snapshot is typically
     /// 1-2x the raw CF data size, so this limits total memory to ~1.5 GiB.
@@ -1663,6 +1747,8 @@ impl AetherStateMachine {
         let key_lease_entries =
             Self::cf_to_vec_checked(db, storage.key_lease_cf(), &mut total_bytes)
                 .map_err(|e| format!("snapshot key_lease CF: {e}"))?;
+        let region_entries = Self::cf_to_vec_checked(db, storage.region_cf(), &mut total_bytes)
+            .map_err(|e| format!("snapshot region CF: {e}"))?;
 
         let snapshot = SnapshotCfData {
             default_entries,
@@ -1671,6 +1757,7 @@ impl AetherStateMachine {
             lease_entries,
             lease_keys_entries,
             key_lease_entries,
+            region_entries,
         };
 
         bincode::serialize(&snapshot).map_err(|e| format!("serialize snapshot: {e}"))
@@ -1718,6 +1805,8 @@ impl AetherStateMachine {
             .map_err(|e| format!("collect lease_keys CF keys: {e}"))?;
         Self::delete_cf_keys(&mut batch, db, self.storage.key_lease_cf())
             .map_err(|e| format!("collect key_lease CF keys: {e}"))?;
+        Self::delete_cf_keys(&mut batch, db, self.storage.region_cf())
+            .map_err(|e| format!("collect region CF keys: {e}"))?;
 
         // Write all snapshot entries.
         Self::load_batch(
@@ -1738,6 +1827,11 @@ impl AetherStateMachine {
             self.storage.key_lease_cf(),
             &snapshot.key_lease_entries,
         );
+        Self::load_batch(
+            &mut batch,
+            self.storage.region_cf(),
+            &snapshot.region_entries,
+        );
 
         // Commit atomically.
         db.write(batch)
@@ -1748,6 +1842,11 @@ impl AetherStateMachine {
             .map_err(|e| format!("reload key indexes: {e}"))?;
         self.key_metas = Self::load_key_metas_from_indexes(&self.storage, &self.key_indexes);
         self.key_leases = Self::load_key_leases_from_meta(&self.key_metas);
+        {
+            let mut mgr = self.shard_manager.lock().unwrap();
+            let max_regions = mgr.max_regions();
+            *mgr = ShardManager::load_from_storage_with_limit(&self.storage, max_regions);
+        }
 
         // Rebuild lease manager from persisted lease data.
         {
@@ -1859,6 +1958,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
+        let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let sm = AetherStateMachine::new(
             tx.clone(),
             storage.clone(),
@@ -1866,6 +1966,7 @@ mod tests {
             lease_store,
             auth_cache,
             auth_enabled,
+            shard_manager,
         );
         (dir, storage, sm)
     }
@@ -2033,6 +2134,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(64);
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
+        let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2040,6 +2142,7 @@ mod tests {
             lease_store,
             auth_cache,
             auth_enabled,
+            shard_manager,
         );
 
         sm.apply_request(
@@ -2068,6 +2171,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(64);
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
+        let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2075,6 +2179,7 @@ mod tests {
             lease_store,
             auth_cache,
             auth_enabled,
+            shard_manager,
         );
 
         sm.apply_request(
@@ -2324,6 +2429,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(64);
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
+        let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2331,6 +2437,7 @@ mod tests {
             lease_store,
             auth_cache,
             auth_enabled,
+            shard_manager,
         );
 
         sm.apply_request(
@@ -3184,6 +3291,7 @@ mod tests {
         let (tx2, _rx2) = tokio::sync::broadcast::channel(64);
         let auth_cache2 = Arc::new(AuthCache::new());
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
+        let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3191,6 +3299,7 @@ mod tests {
             lease_store2,
             auth_cache2,
             auth_enabled2,
+            shard_manager2,
         );
 
         // Write different data to sm2 to verify it gets overwritten.
@@ -3253,6 +3362,7 @@ mod tests {
         let (tx2, _rx2) = tokio::sync::broadcast::channel(64);
         let auth_cache2 = Arc::new(AuthCache::new());
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
+        let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3260,6 +3370,7 @@ mod tests {
             lease_store2,
             auth_cache2,
             auth_enabled2,
+            shard_manager2,
         );
 
         sm2.restore_snapshot(&snapshot_data, 2).unwrap();

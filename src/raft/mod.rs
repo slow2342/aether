@@ -79,6 +79,10 @@ pub enum RaftRequest {
     AuthEnable { root_password_hash: Vec<u8> },
     /// Disable auth
     AuthDisable {},
+    /// Split a region at the given split key
+    RegionSplit { region_id: u64, split_key: Vec<u8> },
+    /// Update region metadata (leader change, replica change)
+    RegionUpdate { region: crate::shard::Region },
 }
 
 /// Raft response types
@@ -118,6 +122,11 @@ pub enum RaftResponse {
     AuthRoleRevokePermission {},
     AuthEnable {},
     AuthDisable {},
+    RegionSplit {
+        parent: crate::shard::Region,
+        child: crate::shard::Region,
+    },
+    RegionUpdate {},
     /// Storage error during apply
     Error {
         message: String,

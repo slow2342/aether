@@ -9,7 +9,9 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 
 use aether::api::health::HealthStatus;
 use aether::api::metrics::{MetricsLayer, MetricsRegistry};
-use aether::api::{AuthService, ClusterService, KvService, LeaseService, WatchService};
+use aether::api::{
+    AuthService, ClusterService, KvService, LeaseService, ShardService, WatchService,
+};
 use aether::auth::AuthLayer;
 use aether::config::{AetherConfig, LogConfig};
 use aether::lease::{LeaseManager, LeaseStore};
@@ -17,6 +19,7 @@ use aether::proto::aether_auth_server::AetherAuthServer;
 use aether::proto::aether_cluster_server::AetherClusterServer;
 use aether::proto::aether_kv_server::AetherKvServer;
 use aether::proto::aether_lease_server::AetherLeaseServer;
+use aether::proto::aether_shard_server::AetherShardServer;
 use aether::proto::aether_watch_server::AetherWatchServer;
 use aether::proto::raft_rpc::raft_rpc_server::RaftRpcServer;
 use aether::raft::node;
@@ -25,6 +28,7 @@ use aether::raft::raftrs_store::RaftRsStore;
 use aether::raft::rpc::RaftRpcImpl;
 use aether::raft::state_machine::AetherStateMachine;
 use aether::raft::{RaftHandle, WatchEvent};
+use aether::shard::manager::ShardManager;
 use aether::storage::{RocksStorage, StorageEngine};
 use aether::watch::WatchManager;
 
@@ -285,6 +289,13 @@ async fn main() -> anyhow::Result<()> {
     let auth_cache_for_api = auth_cache.clone();
     let auth_interceptor_for_api = auth_interceptor.clone();
 
+    // Create shard manager (shared between state machine and API layer)
+    let shard_manager = Arc::new(Mutex::new(ShardManager::load_from_storage_with_limit(
+        &storage,
+        config.shard.max_regions,
+    )));
+    let shard_manager_for_api = shard_manager.clone();
+
     let state_machine = Arc::new(Mutex::new(AetherStateMachine::new(
         watch_tx.clone(),
         storage.clone(),
@@ -292,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
         lease_store_for_sm,
         auth_cache,
         auth_enabled.clone(),
+        shard_manager,
     )));
     // auth_enabled is cloned above; keep a reference for ClusterService below
 
@@ -376,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let cluster_service =
         ClusterService::new(raft_handle.clone(), config.node_id, auth_enabled.clone());
+    let auth_enabled_for_shard = auth_enabled.clone();
     let lease_service = LeaseService::new(
         raft_handle.clone(),
         config.node_id,
@@ -392,6 +405,13 @@ async fn main() -> anyhow::Result<()> {
         auth_enabled_for_api,
         auth_interceptor_for_api.clone(),
         auth_bootstrapped,
+    );
+
+    let shard_service = ShardService::new(
+        raft_handle.clone(),
+        config.node_id,
+        auth_enabled_for_shard,
+        shard_manager_for_api,
     );
 
     // Create RPC server (receives messages from other nodes)
@@ -510,6 +530,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(AetherWatchServer::new(watch_service))
         .add_service(AetherLeaseServer::new(lease_service))
         .add_service(AetherClusterServer::new(cluster_service))
+        .add_service(AetherShardServer::new(shard_service))
         .add_service(RaftRpcServer::new(raft_rpc_service))
         .serve(addr)
         .await?;
