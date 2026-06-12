@@ -11,7 +11,7 @@ use aether::api::health::HealthStatus;
 use aether::api::metrics::{MetricsLayer, MetricsRegistry};
 use aether::api::{
     AuthService, BarrierService, ClusterService, ElectionService, KvService, LeaseService,
-    LockService, MaintenanceService, QueueService, ShardService, WatchService,
+    LockService, MaintenanceService, QueueService, SessionService, ShardService, WatchService,
 };
 use aether::auth::AuthLayer;
 use aether::barrier::BarrierManager;
@@ -29,6 +29,7 @@ use aether::proto::aether_lease_server::AetherLeaseServer;
 use aether::proto::aether_lock_server::AetherLockServer;
 use aether::proto::aether_maintenance_server::AetherMaintenanceServer;
 use aether::proto::aether_queue_server::AetherQueueServer;
+use aether::proto::aether_session_server::AetherSessionServer;
 use aether::proto::aether_shard_server::AetherShardServer;
 use aether::proto::aether_watch_server::AetherWatchServer;
 use aether::proto::raft_rpc::raft_rpc_server::RaftRpcServer;
@@ -39,6 +40,7 @@ use aether::raft::raftrs_store::RaftRsStore;
 use aether::raft::rpc::RaftRpcImpl;
 use aether::raft::state_machine::AetherStateMachine;
 use aether::raft::{RaftHandle, WatchEvent};
+use aether::session::SessionManager;
 use aether::shard::manager::ShardManager;
 use aether::storage::{RocksStorage, StorageEngine};
 use aether::watch::WatchManager;
@@ -322,6 +324,13 @@ async fn main() -> anyhow::Result<()> {
     // Create queue manager (shared between state machine and API layer)
     let queue_manager = Arc::new(Mutex::new(QueueManager::new()));
 
+    // Create session manager (shared with API layer)
+    // Restore from lease manager so existing sessions survive restarts
+    let mut session_manager_inst = SessionManager::new();
+    session_manager_inst.restore(&lease_manager.lock().unwrap());
+    let session_manager = Arc::new(Mutex::new(session_manager_inst));
+    let session_manager_for_api = session_manager.clone();
+
     let state_machine = Arc::new(Mutex::new(AetherStateMachine::new(
         watch_tx.clone(),
         storage.clone(),
@@ -411,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let auth_enabled_for_api = auth_enabled.clone();
+    let auth_enabled_for_session = auth_enabled.clone();
     let storage_for_maintenance = storage.clone();
     let storage_for_election = storage.clone();
     let storage_for_queue = storage.clone();
@@ -468,6 +478,15 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let queue_service = QueueService::new(raft_handle.clone(), config.node_id, storage_for_queue);
+
+    let session_service = SessionService::new(
+        raft_handle.clone(),
+        config.node_id,
+        lease_manager.clone(),
+        session_manager_for_api,
+        config.lease.max_ttl,
+        auth_enabled_for_session,
+    );
 
     let alarm_manager = Arc::new(AlarmManager::new());
     let maintenance_service = MaintenanceService::new(
@@ -597,6 +616,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(AetherElectionServer::new(election_service))
         .add_service(AetherBarrierServer::new(barrier_service))
         .add_service(AetherQueueServer::new(queue_service))
+        .add_service(AetherSessionServer::new(session_service))
         .add_service(AetherClusterServer::new(cluster_service))
         .add_service(AetherMaintenanceServer::new(maintenance_service))
         .add_service(AetherShardServer::new(shard_service))

@@ -9,6 +9,7 @@ mod lock;
 pub mod maintenance;
 pub mod metrics;
 mod queue;
+mod session;
 mod shard;
 mod watch;
 
@@ -21,5 +22,6 @@ pub use self::lease::LeaseService;
 pub use self::lock::LockService;
 pub use self::maintenance::MaintenanceService;
 pub use self::queue::QueueService;
+pub use self::session::SessionService;
 pub use self::shard::ShardService;
 pub use self::watch::WatchService;

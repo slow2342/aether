@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherSession provides session management with timeout negotiation.
+// A session is a higher-level abstraction over leases: it creates a lease
+// with a negotiated TTL and provides session-scoped lifecycle management.
+// When a session expires or is closed, all keys attached to the session
+// are automatically deleted.
+service AetherSession {
+    // Create creates a new session with the requested TTL.
+    // The server may adjust the TTL (timeout negotiation) — the actual
+    // granted TTL is returned in the response.
+    rpc Create(SessionCreateRequest) returns (SessionCreateResponse);
+    // Close closes a session and deletes all attached keys.
+    rpc Close(SessionCloseRequest) returns (SessionCloseResponse);
+    // KeepAlive maintains the session by refreshing its TTL.
+    // The client should send periodic KeepAlive requests at TTL/3 frequency.
+    // The server responds with the remaining TTL.
+    rpc KeepAlive(stream SessionKeepAliveRequest) returns (stream SessionKeepAliveResponse);
+    // Query returns information about a session.
+    rpc Query(SessionQueryRequest) returns (SessionQueryResponse);
+}
+
+message SessionCreateRequest {
+    // ttl is the requested time-to-live in seconds.
+    // The server may grant a shorter TTL (timeout negotiation).
+    int64 ttl = 1;
+}
+
+message SessionCreateResponse {
+    ResponseHeader header = 1;
+    // id is the session identifier (same as the underlying lease ID).
+    int64 id = 2;
+    // granted_ttl is the actual TTL granted by the server (in seconds).
+    // This may be shorter than the requested TTL.
+    int64 granted_ttl = 3;
+}
+
+message SessionCloseRequest {
+    // id is the session to close.
+    int64 id = 1;
+}
+
+message SessionCloseResponse {
+    ResponseHeader header = 1;
+}
+
+message SessionKeepAliveRequest {
+    // id is the session to keep alive.
+    int64 id = 1;
+}
+
+message SessionKeepAliveResponse {
+    ResponseHeader header = 1;
+    // ttl is the remaining TTL in seconds after the keep alive.
+    int64 ttl = 2;
+}
+
+message SessionQueryRequest {
+    // id is the session to query.
+    int64 id = 1;
+}
+
+message SessionQueryResponse {
+    ResponseHeader header = 1;
+    // id is the session identifier.
+    int64 id = 2;
+    // ttl is the remaining TTL in seconds.
+    int64 ttl = 3;
+    // granted_ttl is the originally granted TTL in seconds.
+    int64 granted_ttl = 4;
+    // keys is the number of keys attached to this session.
+    int64 keys = 5;
+}
