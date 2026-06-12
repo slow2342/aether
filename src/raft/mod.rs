@@ -95,6 +95,14 @@ pub enum RaftRequest {
     },
     /// Resign from leadership in an election
     ElectionResign { leader_key: Vec<u8> },
+    /// Create and hold a barrier
+    BarrierCreate { name: Vec<u8>, lease_id: i64 },
+    /// Release a barrier
+    BarrierRelease { name: Vec<u8> },
+    /// Enqueue an item to a named queue
+    QueueEnqueue { name: Vec<u8>, value: Vec<u8> },
+    /// Dequeue the front item from a named queue
+    QueueDequeue { name: Vec<u8> },
 }
 
 /// Raft response types
@@ -153,6 +161,23 @@ pub enum RaftResponse {
     ElectionResign {},
     /// Election resign requested but leader key not found
     ElectionResignNotFound {},
+    BarrierCreate {
+        key: Vec<u8>,
+    },
+    /// Barrier already held by another caller
+    BarrierAlreadyHeld {
+        current_key: Vec<u8>,
+    },
+    BarrierRelease {},
+    QueueEnqueue {
+        key: Vec<u8>,
+    },
+    QueueDequeue {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Queue is empty
+    QueueDequeueEmpty {},
     /// Storage error during apply
     Error {
         message: String,

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod barrier;
 pub mod cluster;
 pub mod config;
 pub mod election;
@@ -7,6 +8,7 @@ pub mod error;
 pub mod lease;
 pub mod lock;
 pub mod proto;
+pub mod queue;
 pub mod raft;
 pub mod shard;
 pub mod storage;

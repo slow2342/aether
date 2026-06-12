@@ -1,4 +1,5 @@
 mod auth;
+mod barrier;
 mod cluster;
 mod election;
 pub mod health;
@@ -7,15 +8,18 @@ mod lease;
 mod lock;
 pub mod maintenance;
 pub mod metrics;
+mod queue;
 mod shard;
 mod watch;
 
 pub use self::auth::AuthService;
+pub use self::barrier::BarrierService;
 pub use self::cluster::ClusterService;
 pub use self::election::ElectionService;
 pub use self::kv::KvService;
 pub use self::lease::LeaseService;
 pub use self::lock::LockService;
 pub use self::maintenance::MaintenanceService;
+pub use self::queue::QueueService;
 pub use self::shard::ShardService;
 pub use self::watch::WatchService;
