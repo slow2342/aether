@@ -3,6 +3,14 @@ use tonic::Status;
 
 use super::{NodeId, RaftRequest, RaftResponse};
 
+/// Cluster member with role information.
+#[derive(Debug, Clone)]
+pub struct MemberInfo {
+    pub id: NodeId,
+    pub addr: String,
+    pub is_learner: bool,
+}
+
 /// Raft error type for the handle trait.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RaftError {
@@ -46,11 +54,14 @@ pub trait RaftHandle: Send + Sync + 'static {
     /// The caller must wait until `applied_index() >= returned_index` before reading.
     async fn read_index(&self) -> Result<u64, RaftError>;
 
-    /// All cluster members: (node_id, addr).
-    fn members(&self) -> Vec<(u64, String)>;
+    /// All cluster members with role information.
+    fn members(&self) -> Vec<MemberInfo>;
 
     /// Add a learner node to the cluster.
     async fn add_learner(&self, id: u64, addr: String) -> Result<(), RaftError>;
+
+    /// Remove a node (voter or learner) from the cluster.
+    async fn remove_node(&self, id: u64) -> Result<(), RaftError>;
 
     /// Change voter configuration. `voters` is the complete set of voter node IDs.
     async fn change_membership(&self, voters: Vec<u64>) -> Result<(), RaftError>;
@@ -59,14 +70,15 @@ pub trait RaftHandle: Send + Sync + 'static {
 /// Shared helper for leader-required operations.
 /// Returns `Ok(())` if this node is the leader, `Err` with leader redirect info otherwise.
 pub fn require_leader(raft: &dyn RaftHandle, node_id: NodeId) -> Result<(), Status> {
-    match raft.leader_id() {
+    let current_leader = raft.leader_id();
+    match current_leader {
         Some(id) if id == node_id => Ok(()),
-        Some(_) => {
+        Some(leader_id) => {
             let leader_addr = raft
                 .members()
-                .iter()
-                .find(|(id, _)| Some(*id) == raft.leader_id())
-                .map(|(_, addr)| addr.clone());
+                .into_iter()
+                .find(|m| m.id == leader_id)
+                .map(|m| m.addr);
 
             let mut status = Status::unavailable("not leader");
             if let Some(addr) = leader_addr {
@@ -94,9 +106,9 @@ pub async fn ensure_linearizable(raft: &dyn RaftHandle) -> Result<u64, Status> {
             if let Some(leader_id) = leader {
                 let leader_addr = raft
                     .members()
-                    .iter()
-                    .find(|(id, _)| *id == leader_id)
-                    .map(|(_, addr)| addr.clone());
+                    .into_iter()
+                    .find(|m| m.id == leader_id)
+                    .map(|m| m.addr);
                 if let Some(addr) = leader_addr {
                     let mut metadata = tonic::metadata::MetadataMap::new();
                     if let Ok(val) = addr.parse() {
@@ -119,14 +131,14 @@ mod tests {
 
     struct MockRaftHandle {
         leader: Option<u64>,
-        members: Vec<(u64, String)>,
+        members: Vec<MemberInfo>,
         commit_idx: u64,
         applied_idx: AtomicU64,
         read_index_result: Option<Result<u64, RaftError>>,
     }
 
     impl MockRaftHandle {
-        fn new(leader: Option<u64>, members: Vec<(u64, String)>) -> Self {
+        fn new(leader: Option<u64>, members: Vec<MemberInfo>) -> Self {
             Self {
                 leader,
                 members,
@@ -174,10 +186,13 @@ mod tests {
                 Err(RaftError::NoLeader)
             }
         }
-        fn members(&self) -> Vec<(u64, String)> {
+        fn members(&self) -> Vec<MemberInfo> {
             self.members.clone()
         }
         async fn add_learner(&self, _: u64, _: String) -> Result<(), RaftError> {
+            unimplemented!()
+        }
+        async fn remove_node(&self, _: u64) -> Result<(), RaftError> {
             unimplemented!()
         }
         async fn change_membership(&self, _: Vec<u64>) -> Result<(), RaftError> {
@@ -185,11 +200,19 @@ mod tests {
         }
     }
 
+    fn voter(id: NodeId, addr: &str) -> MemberInfo {
+        MemberInfo {
+            id,
+            addr: addr.into(),
+            is_learner: false,
+        }
+    }
+
     // --- require_leader tests ---
 
     #[test]
     fn test_require_leader_ok_when_is_leader() {
-        let raft = MockRaftHandle::new(Some(1), vec![(1, "127.0.0.1:2380".into())]);
+        let raft = MockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]);
         assert!(require_leader(&raft, 1).is_ok());
     }
 
@@ -197,7 +220,7 @@ mod tests {
     fn test_require_leader_err_when_not_leader() {
         let raft = MockRaftHandle::new(
             Some(2),
-            vec![(1, "127.0.0.1:2380".into()), (2, "127.0.0.2:2380".into())],
+            vec![voter(1, "127.0.0.1:2380"), voter(2, "127.0.0.2:2380")],
         );
         let err = require_leader(&raft, 1).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
@@ -220,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_index_returns_commit_index_when_leader() {
         let raft =
-            MockRaftHandle::new(Some(1), vec![(1, "127.0.0.1:2380".into())]).with_commit_index(42);
+            MockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]).with_commit_index(42);
         let idx = raft.read_index().await.unwrap();
         assert_eq!(idx, 42);
     }
@@ -254,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_linearizable_ok_when_leader() {
         let raft =
-            MockRaftHandle::new(Some(1), vec![(1, "127.0.0.1:2380".into())]).with_commit_index(10);
+            MockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]).with_commit_index(10);
         let idx = ensure_linearizable(&raft).await.unwrap();
         assert_eq!(idx, 10);
     }
@@ -274,7 +297,7 @@ mod tests {
             .with_commit_index(0);
         // Need members so redirect metadata can be populated.
         let raft = MockRaftHandle {
-            members: vec![(1, "127.0.0.1:2380".into()), (2, "127.0.0.2:2380".into())],
+            members: vec![voter(1, "127.0.0.1:2380"), voter(2, "127.0.0.2:2380")],
             ..raft
         };
         let err = ensure_linearizable(&raft).await.unwrap_err();
@@ -304,5 +327,201 @@ mod tests {
         let err = ensure_linearizable(&raft).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
         assert!(err.message().contains("read index failed"));
+    }
+
+    // --- Full mock with learner support ---
+
+    use std::sync::RwLock;
+
+    struct FullMockRaftHandle {
+        leader: Option<u64>,
+        members: RwLock<Vec<MemberInfo>>,
+    }
+
+    impl FullMockRaftHandle {
+        fn new(leader: Option<u64>, members: Vec<MemberInfo>) -> Self {
+            Self {
+                leader,
+                members: RwLock::new(members),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RaftHandle for FullMockRaftHandle {
+        async fn propose(&self, _: RaftRequest) -> Result<RaftResponse, RaftError> {
+            unimplemented!()
+        }
+        fn leader_id(&self) -> Option<u64> {
+            self.leader
+        }
+        fn commit_index(&self) -> u64 {
+            0
+        }
+        fn applied_index(&self) -> u64 {
+            0
+        }
+        async fn wait_for_apply(&self) {}
+        async fn read_index(&self) -> Result<u64, RaftError> {
+            Ok(0)
+        }
+        fn members(&self) -> Vec<MemberInfo> {
+            self.members.read().unwrap().clone()
+        }
+        async fn add_learner(&self, id: u64, addr: String) -> Result<(), RaftError> {
+            let mut members = self.members.write().unwrap();
+            if members.iter().any(|m| m.id == id) {
+                return Err(RaftError::Internal(format!("node {id} already exists")));
+            }
+            members.push(MemberInfo {
+                id,
+                addr,
+                is_learner: true,
+            });
+            Ok(())
+        }
+        async fn remove_node(&self, id: u64) -> Result<(), RaftError> {
+            self.members.write().unwrap().retain(|m| m.id != id);
+            Ok(())
+        }
+        async fn change_membership(&self, voters: Vec<u64>) -> Result<(), RaftError> {
+            let mut members = self.members.write().unwrap();
+            let old_voters: Vec<u64> = members
+                .iter()
+                .filter(|m| !m.is_learner)
+                .map(|m| m.id)
+                .collect();
+            let to_add: Vec<u64> = voters
+                .iter()
+                .filter(|id| !old_voters.contains(id))
+                .copied()
+                .collect();
+            for node_id in to_add {
+                if let Some(m) = members.iter_mut().find(|m| m.id == node_id) {
+                    m.is_learner = false;
+                } else {
+                    members.push(MemberInfo {
+                        id: node_id,
+                        addr: String::new(),
+                        is_learner: false,
+                    });
+                }
+            }
+            members.retain(|m| voters.contains(&m.id));
+            Ok(())
+        }
+    }
+
+    fn learner(id: NodeId, addr: &str) -> MemberInfo {
+        MemberInfo {
+            id,
+            addr: addr.into(),
+            is_learner: true,
+        }
+    }
+
+    // --- learner lifecycle tests ---
+
+    #[tokio::test]
+    async fn test_add_learner_sets_is_learner() {
+        let raft = FullMockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]);
+        raft.add_learner(2, "127.0.0.2:2380".into()).await.unwrap();
+
+        let members = raft.members();
+        assert_eq!(members.len(), 2);
+        let node2 = members.iter().find(|m| m.id == 2).unwrap();
+        assert!(node2.is_learner);
+    }
+
+    #[tokio::test]
+    async fn test_add_learner_rejects_duplicate() {
+        let raft = FullMockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]);
+        raft.add_learner(2, "127.0.0.2:2380".into()).await.unwrap();
+        let err = raft
+            .add_learner(2, "127.0.0.2:2380".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RaftError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn test_promote_learner_to_voter() {
+        let raft = FullMockRaftHandle::new(
+            Some(1),
+            vec![voter(1, "127.0.0.1:2380"), learner(2, "127.0.0.2:2380")],
+        );
+        // Promote: change_membership with both IDs.
+        raft.change_membership(vec![1, 2]).await.unwrap();
+
+        let members = raft.members();
+        let node2 = members.iter().find(|m| m.id == 2).unwrap();
+        assert!(!node2.is_learner);
+    }
+
+    #[tokio::test]
+    async fn test_remove_learner() {
+        let raft = FullMockRaftHandle::new(
+            Some(1),
+            vec![voter(1, "127.0.0.1:2380"), learner(2, "127.0.0.2:2380")],
+        );
+        raft.remove_node(2).await.unwrap();
+
+        let members = raft.members();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_voter() {
+        let raft = FullMockRaftHandle::new(
+            Some(1),
+            vec![voter(1, "127.0.0.1:2380"), voter(2, "127.0.0.2:2380")],
+        );
+        raft.remove_node(2).await.unwrap();
+
+        let members = raft.members();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_learner_then_remove() {
+        let raft = FullMockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]);
+        raft.add_learner(2, "127.0.0.2:2380".into()).await.unwrap();
+        assert_eq!(raft.members().len(), 2);
+
+        raft.remove_node(2).await.unwrap();
+        assert_eq!(raft.members().len(), 1);
+        assert!(raft.members().iter().all(|m| m.id != 2));
+    }
+
+    #[tokio::test]
+    async fn test_add_learner_then_promote_then_remove() {
+        let raft = FullMockRaftHandle::new(Some(1), vec![voter(1, "127.0.0.1:2380")]);
+
+        // Add as learner.
+        raft.add_learner(2, "127.0.0.2:2380".into()).await.unwrap();
+        assert!(
+            raft.members()
+                .iter()
+                .find(|m| m.id == 2)
+                .unwrap()
+                .is_learner
+        );
+
+        // Promote to voter.
+        raft.change_membership(vec![1, 2]).await.unwrap();
+        assert!(
+            !raft
+                .members()
+                .iter()
+                .find(|m| m.id == 2)
+                .unwrap()
+                .is_learner
+        );
+
+        // Remove.
+        raft.remove_node(2).await.unwrap();
+        assert_eq!(raft.members().len(), 1);
     }
 }
