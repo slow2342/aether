@@ -4,10 +4,12 @@ pub mod health;
 mod kv;
 mod lease;
 pub mod metrics;
+mod shard;
 mod watch;
 
 pub use self::auth::AuthService;
 pub use self::cluster::ClusterService;
 pub use self::kv::KvService;
 pub use self::lease::LeaseService;
+pub use self::shard::ShardService;
 pub use self::watch::WatchService;

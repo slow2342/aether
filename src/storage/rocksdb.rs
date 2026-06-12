@@ -16,6 +16,7 @@ const COLUMN_FAMILIES: &[&str] = &[
     "lease_keys",
     "key_lease",
     "mvcc",
+    "region",
 ];
 
 /// RocksDB storage engine implementation
@@ -74,6 +75,10 @@ impl RocksStorage {
 
     pub fn meta_cf(&self) -> &rocksdb::ColumnFamily {
         self.db.cf_handle("meta").expect("meta CF not found")
+    }
+
+    pub fn region_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle("region").expect("region CF not found")
     }
 
     /// Clear all user data from the default and mvcc column families.

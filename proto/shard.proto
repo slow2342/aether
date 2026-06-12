@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+service AetherShard {
+    // GetRegion returns the region that owns the given key.
+    rpc GetRegion(GetRegionRequest) returns (GetRegionResponse);
+
+    // ListRegions returns all regions in the cluster.
+    rpc ListRegions(ListRegionsRequest) returns (ListRegionsResponse);
+
+    // SplitRegion splits a region at the given split key.
+    rpc SplitRegion(SplitRegionRequest) returns (SplitRegionResponse);
+}
+
+message GetRegionRequest {
+    bytes key = 1;
+}
+
+message GetRegionResponse {
+    ResponseHeader header = 1;
+    Region region = 2;
+}
+
+message ListRegionsRequest {}
+
+message ListRegionsResponse {
+    ResponseHeader header = 1;
+    repeated Region regions = 2;
+}
+
+message SplitRegionRequest {
+    uint64 region_id = 1;
+    bytes split_key = 2;
+}
+
+message SplitRegionResponse {
+    ResponseHeader header = 1;
+    Region parent = 2;
+    Region child = 3;
+}
+
+message Region {
+    uint64 id = 1;
+    bytes start_key = 2;
+    bytes end_key = 3;
+    RegionEpoch region_epoch = 4;
+    uint64 leader = 5;
+    repeated uint64 replicas = 6;
+}
+
+message RegionEpoch {
+    uint64 conf_ver = 1;
+    uint64 version = 2;
+}

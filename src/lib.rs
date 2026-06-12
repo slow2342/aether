@@ -5,5 +5,6 @@ pub mod error;
 pub mod lease;
 pub mod proto;
 pub mod raft;
+pub mod shard;
 pub mod storage;
 pub mod watch;
