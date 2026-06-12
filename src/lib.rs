@@ -10,6 +10,7 @@ pub mod lock;
 pub mod proto;
 pub mod queue;
 pub mod raft;
+pub mod session;
 pub mod shard;
 pub mod storage;
 pub mod watch;
