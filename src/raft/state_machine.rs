@@ -7,6 +7,7 @@ use rocksdb::WriteBatch;
 use super::{KeyValue, RaftRequest, RaftResponse, WatchEvent};
 use crate::auth::AuthCache;
 use crate::lease::{LeaseManager, LeaseStore};
+use crate::lock::LockManager;
 use crate::shard::manager::ShardManager;
 use crate::storage::mvcc::{
     KeyIndex, MvccValue, encode_mvcc_key, load_key_indexes, save_global_revision,
@@ -78,6 +79,8 @@ pub struct AetherStateMachine {
     pub key_leases: HashMap<Vec<u8>, i64>,
     /// Shard manager: in-memory index of all regions (shared with API layer).
     pub shard_manager: Arc<Mutex<ShardManager>>,
+    /// In-memory lock manager (shared with API layer).
+    pub lock_manager: Arc<Mutex<LockManager>>,
 }
 
 /// Captures pre-mutation in-memory state for keys touched during an apply.
@@ -187,6 +190,7 @@ impl TxnSnapshot {
 }
 
 impl AetherStateMachine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
         storage: Arc<RocksStorage>,
@@ -195,11 +199,21 @@ impl AetherStateMachine {
         auth_cache: Arc<AuthCache>,
         auth_enabled: Arc<AtomicBool>,
         shard_manager: Arc<Mutex<ShardManager>>,
+        lock_manager: Arc<Mutex<LockManager>>,
     ) -> Self {
         let key_indexes = load_key_indexes(storage.db(), storage.mvcc_cf())
             .expect("failed to load key indexes from mvcc CF");
         let key_metas = Self::load_key_metas_from_indexes(&storage, &key_indexes);
         let key_leases = Self::load_key_leases_from_meta(&key_metas);
+
+        // Restore lock state from persistent storage
+        {
+            let mut mgr = lock_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&storage) {
+                tracing::error!(error = %e, "failed to restore lock state from storage");
+            }
+        }
+
         Self {
             last_applied: 0,
             storage,
@@ -212,6 +226,7 @@ impl AetherStateMachine {
             key_metas,
             key_leases,
             shard_manager,
+            lock_manager,
         }
     }
 
@@ -991,6 +1006,10 @@ impl AetherStateMachine {
                 split_key,
             } => self.apply_region_split(region_id, split_key),
             RaftRequest::RegionUpdate { region } => self.apply_region_update(region),
+            RaftRequest::LockAcquire { name, lease_id } => {
+                self.apply_lock_acquire(name, lease_id, revision)
+            }
+            RaftRequest::LockRelease { key } => self.apply_lock_release(key, revision),
         }
     }
 
@@ -1094,7 +1113,7 @@ impl AetherStateMachine {
             let mgr = self.lease_manager.lock().unwrap();
             let keys = match mgr.get_keys(id) {
                 Some(s) => s.iter().cloned().collect::<Vec<_>>(),
-                None => return RaftResponse::LeaseRevoke {}, // idempotent
+                None => Vec::new(), // No user-data keys attached, but locks may still exist
             };
             keys.into_iter()
                 .map(|k| {
@@ -1104,6 +1123,17 @@ impl AetherStateMachine {
                 })
                 .collect()
         };
+
+        // Release all locks associated with this lease (before checking if lease exists)
+        self.apply_lock_release_by_lease(id);
+
+        // If no user-data keys and lease already gone, this is an idempotent no-op.
+        if key_values.is_empty() {
+            let mgr = self.lease_manager.lock().unwrap();
+            if mgr.get(id).is_none() {
+                return RaftResponse::LeaseRevoke {};
+            }
+        }
 
         // Prepare key_index mutations on clones.
         let mut ki_mutations: Vec<(Vec<u8>, KeyIndex)> = Vec::new();
@@ -1714,6 +1744,123 @@ impl AetherStateMachine {
         RaftResponse::RegionUpdate {}
     }
 
+    fn apply_lock_acquire(&mut self, name: Vec<u8>, lease_id: i64, _revision: u64) -> RaftResponse {
+        let key = crate::lock::lock_key(&name);
+
+        // Check if lock is already held
+        {
+            let mgr = self.lock_manager.lock().unwrap();
+            if mgr.is_locked(&name) {
+                return RaftResponse::Error {
+                    message: format!("lock '{}' is already held", String::from_utf8_lossy(&name)),
+                };
+            }
+        }
+
+        // Store the lock key in the KV store with lease_id
+        // Value format: [lease_id: i64 BE][name_bytes]
+        let value = crate::lock::LockManager::encode_value(&name, lease_id);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.storage.default_cf(), &key, &value);
+
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to persist lock: {e}"),
+            };
+        }
+
+        // Update in-memory lock manager (after successful KV write)
+        // This is a separate lock acquisition because we need to release the lock
+        // between the check and the update to avoid holding it during I/O.
+        {
+            let mut mgr = self.lock_manager.lock().unwrap();
+            mgr.acquire(name, key.clone(), lease_id);
+        }
+
+        tracing::debug!(
+            lock = %String::from_utf8_lossy(&key),
+            lease_id = lease_id,
+            "lock acquired"
+        );
+
+        RaftResponse::LockAcquire { key }
+    }
+
+    fn apply_lock_release(&mut self, key: Vec<u8>, _revision: u64) -> RaftResponse {
+        // Validate lock key format
+        if crate::lock::lock_name(&key).is_none() {
+            return RaftResponse::Error {
+                message: "invalid lock key".to_string(),
+            };
+        }
+
+        // Remove from KV store
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(self.storage.default_cf(), &key);
+
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to delete lock key: {e}"),
+            };
+        }
+
+        // Update in-memory lock manager (after successful KV delete)
+        // If lock not found in memory, that's OK - it might have been restored from snapshot
+        let mut mgr = self.lock_manager.lock().unwrap();
+        mgr.release(&key);
+
+        tracing::debug!(
+            lock = %String::from_utf8_lossy(&key),
+            "lock released"
+        );
+
+        RaftResponse::LockRelease {}
+    }
+
+    /// Release all locks associated with a lease.
+    /// Called when a lease is revoked or expires.
+    fn apply_lock_release_by_lease(&mut self, lease_id: i64) {
+        // First, collect the keys to release from memory (without removing them yet)
+        let keys_to_release: Vec<Vec<u8>> = {
+            let mgr = self.lock_manager.lock().unwrap();
+            let keys = mgr.get_keys_by_lease(lease_id);
+            tracing::debug!(
+                lease_id = lease_id,
+                lock_count = mgr.lock_count(),
+                keys_found = keys.len(),
+                "collecting locks for lease release"
+            );
+            keys
+        };
+
+        if keys_to_release.is_empty() {
+            return;
+        }
+
+        // Delete lock keys from KV store first
+        let mut batch = WriteBatch::default();
+        for key in &keys_to_release {
+            batch.delete_cf(self.storage.default_cf(), key);
+        }
+
+        if let Err(e) = self.storage.db().write(batch) {
+            tracing::error!(error = %e, lease_id = lease_id, "failed to delete lock keys for lease");
+            return; // Don't update memory if KV delete failed
+        }
+
+        // Now remove from memory (after successful KV delete)
+        {
+            let mut mgr = self.lock_manager.lock().unwrap();
+            mgr.release_by_lease(lease_id);
+        }
+
+        tracing::debug!(
+            lease_id = lease_id,
+            count = keys_to_release.len(),
+            "released locks for lease"
+        );
+    }
+
     /// Maximum allowed snapshot size (512 MiB).  Prevents OOM when the database
     /// is larger than available memory.  The serialized snapshot is typically
     /// 1-2x the raw CF data size, so this limits total memory to ~1.5 GiB.
@@ -1856,10 +2003,19 @@ impl AetherStateMachine {
             }
         }
 
+        // Rebuild lock manager from persisted lock data.
+        {
+            let mut mgr = self.lock_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&self.storage) {
+                tracing::warn!(error = %e, "failed to restore lock manager from snapshot");
+            }
+        }
+
         self.last_applied = applied_index;
         tracing::info!(
             applied_index,
             keys = self.key_metas.len(),
+            locks = self.lock_manager.lock().unwrap().lock_count(),
             "restored from snapshot"
         );
         Ok(())
@@ -1959,6 +2115,7 @@ mod tests {
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let sm = AetherStateMachine::new(
             tx.clone(),
             storage.clone(),
@@ -1967,6 +2124,7 @@ mod tests {
             auth_cache,
             auth_enabled,
             shard_manager,
+            lock_manager,
         );
         (dir, storage, sm)
     }
@@ -2135,6 +2293,7 @@ mod tests {
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2143,6 +2302,7 @@ mod tests {
             auth_cache,
             auth_enabled,
             shard_manager,
+            lock_manager,
         );
 
         sm.apply_request(
@@ -2172,6 +2332,7 @@ mod tests {
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2180,6 +2341,7 @@ mod tests {
             auth_cache,
             auth_enabled,
             shard_manager,
+            lock_manager,
         );
 
         sm.apply_request(
@@ -2430,6 +2592,7 @@ mod tests {
         let auth_cache = Arc::new(AuthCache::new());
         let auth_enabled = Arc::new(AtomicBool::new(false));
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2438,6 +2601,7 @@ mod tests {
             auth_cache,
             auth_enabled,
             shard_manager,
+            lock_manager,
         );
 
         sm.apply_request(
@@ -3292,6 +3456,7 @@ mod tests {
         let auth_cache2 = Arc::new(AuthCache::new());
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3300,6 +3465,7 @@ mod tests {
             auth_cache2,
             auth_enabled2,
             shard_manager2,
+            lock_manager2,
         );
 
         // Write different data to sm2 to verify it gets overwritten.
@@ -3363,6 +3529,7 @@ mod tests {
         let auth_cache2 = Arc::new(AuthCache::new());
         let auth_enabled2 = Arc::new(AtomicBool::new(false));
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3371,6 +3538,7 @@ mod tests {
             auth_cache2,
             auth_enabled2,
             shard_manager2,
+            lock_manager2,
         );
 
         sm2.restore_snapshot(&snapshot_data, 2).unwrap();
@@ -3387,5 +3555,199 @@ mod tests {
                 .unwrap()
                 .contains(b"leased_key".as_slice())
         );
+    }
+
+    #[test]
+    fn test_snapshot_preserves_lock_state() {
+        let (_dir, storage, mut sm) = setup();
+
+        // Acquire a lock.
+        let resp = sm.apply_request(
+            RaftRequest::LockAcquire {
+                name: b"test-lock".to_vec(),
+                lease_id: 0,
+            },
+            1,
+        );
+        let lock_key = match resp {
+            RaftResponse::LockAcquire { key } => key,
+            other => panic!("expected LockAcquire, got: {other:?}"),
+        };
+
+        // Verify lock exists in memory.
+        {
+            let mgr = sm.lock_manager.lock().unwrap();
+            assert!(mgr.is_locked(b"test-lock"));
+            assert_eq!(mgr.lock_count(), 1);
+        }
+
+        // Create snapshot.
+        let snapshot_data = AetherStateMachine::create_snapshot(&storage).unwrap();
+
+        // Restore to a fresh state machine.
+        let lease_store2 = LeaseStore::new(storage.clone());
+        let (lease_manager2, _rx2) = LeaseManager::new(10000, 1);
+        let lease_manager2 = Arc::new(Mutex::new(lease_manager2));
+        let (tx2, _rx2) = tokio::sync::broadcast::channel(64);
+        let auth_cache2 = Arc::new(AuthCache::new());
+        let auth_enabled2 = Arc::new(AtomicBool::new(false));
+        let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
+        let mut sm2 = AetherStateMachine::new(
+            tx2,
+            storage.clone(),
+            lease_manager2,
+            lease_store2,
+            auth_cache2,
+            auth_enabled2,
+            shard_manager2,
+            lock_manager2,
+        );
+
+        // Verify lock exists in fresh state machine (from startup restore).
+        {
+            let mgr = sm2.lock_manager.lock().unwrap();
+            assert!(mgr.is_locked(b"test-lock"));
+            assert_eq!(mgr.lock_count(), 1);
+        }
+
+        // Restore from snapshot.
+        sm2.restore_snapshot(&snapshot_data, 2).unwrap();
+
+        // Verify lock survived the snapshot roundtrip.
+        {
+            let mgr = sm2.lock_manager.lock().unwrap();
+            assert!(mgr.is_locked(b"test-lock"));
+            assert_eq!(mgr.lock_count(), 1);
+            assert_eq!(mgr.get_key(b"test-lock"), Some(lock_key.as_slice()));
+        }
+
+        // Verify lock key exists in KV store.
+        let stored_value = storage.get(&lock_key).unwrap();
+        assert!(stored_value.is_some());
+    }
+
+    #[test]
+    fn test_snapshot_preserves_lock_with_lease() {
+        let (_dir, storage, mut sm) = setup();
+
+        // Grant a lease.
+        let resp = sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 60,
+                expiry_time: now_millis() + 60_000,
+            },
+            1,
+        );
+        let lease_id = match resp {
+            RaftResponse::LeaseGrant { id, .. } => id,
+            other => panic!("expected LeaseGrant, got: {other:?}"),
+        };
+
+        // Acquire a lock with lease.
+        let resp = sm.apply_request(
+            RaftRequest::LockAcquire {
+                name: b"leased-lock".to_vec(),
+                lease_id,
+            },
+            2,
+        );
+        match resp {
+            RaftResponse::LockAcquire { .. } => {}
+            other => panic!("expected LockAcquire, got: {other:?}"),
+        }
+
+        // Verify lock has lease association.
+        {
+            let mgr = sm.lock_manager.lock().unwrap();
+            let key = mgr.get_key(b"leased-lock").unwrap();
+            assert_eq!(mgr.get_lease_id(key), Some(lease_id));
+        }
+
+        // Create snapshot.
+        let snapshot_data = AetherStateMachine::create_snapshot(&storage).unwrap();
+
+        // Restore to a fresh state machine.
+        let lease_store2 = LeaseStore::new(storage.clone());
+        let (lease_manager2, _rx2) = LeaseManager::new(10000, 1);
+        let lease_manager2 = Arc::new(Mutex::new(lease_manager2));
+        let (tx2, _rx2) = tokio::sync::broadcast::channel(64);
+        let auth_cache2 = Arc::new(AuthCache::new());
+        let auth_enabled2 = Arc::new(AtomicBool::new(false));
+        let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
+        let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
+        let mut sm2 = AetherStateMachine::new(
+            tx2,
+            storage.clone(),
+            lease_manager2,
+            lease_store2,
+            auth_cache2,
+            auth_enabled2,
+            shard_manager2,
+            lock_manager2,
+        );
+
+        // Restore from snapshot.
+        sm2.restore_snapshot(&snapshot_data, 2).unwrap();
+
+        // Verify lock and lease association survived.
+        {
+            let mgr = sm2.lock_manager.lock().unwrap();
+            assert!(mgr.is_locked(b"leased-lock"));
+            let key = mgr.get_key(b"leased-lock").unwrap();
+            assert_eq!(mgr.get_lease_id(key), Some(lease_id));
+        }
+    }
+
+    #[test]
+    fn test_lease_revoke_releases_locks() {
+        let (_dir, _storage, mut sm) = setup();
+
+        // Grant a lease.
+        let resp = sm.apply_request(
+            RaftRequest::LeaseGrant {
+                ttl: 60,
+                expiry_time: now_millis() + 60_000,
+            },
+            1,
+        );
+        let lease_id = match resp {
+            RaftResponse::LeaseGrant { id, .. } => id,
+            other => panic!("expected LeaseGrant, got: {other:?}"),
+        };
+
+        // Acquire a lock with lease.
+        sm.apply_request(
+            RaftRequest::LockAcquire {
+                name: b"test-lock".to_vec(),
+                lease_id,
+            },
+            2,
+        );
+
+        // Verify lock exists and has correct lease association.
+        {
+            let mgr = sm.lock_manager.lock().unwrap();
+            assert!(mgr.is_locked(b"test-lock"));
+            let key = mgr.get_key(b"test-lock").unwrap();
+            let actual_lease_id = mgr.get_lease_id(key);
+            assert_eq!(
+                actual_lease_id,
+                Some(lease_id),
+                "lease_id mismatch: expected {lease_id}, got {actual_lease_id:?}"
+            );
+        }
+
+        // Revoke the lease.
+        sm.apply_request(RaftRequest::LeaseRevoke { id: lease_id }, 3);
+
+        // Verify lock was released.
+        {
+            let mgr = sm.lock_manager.lock().unwrap();
+            assert!(
+                !mgr.is_locked(b"test-lock"),
+                "lock should have been released after lease revoke"
+            );
+        }
     }
 }

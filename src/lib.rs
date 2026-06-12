@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod config;
 pub mod error;
 pub mod lease;
+pub mod lock;
 pub mod proto;
 pub mod raft;
 pub mod shard;

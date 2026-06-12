@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherLock provides distributed lock operations.
+// Locks are implemented using leases: a lock creates a key with the given
+// lease, ensuring automatic release when the lease expires.
+service AetherLock {
+    // Lock acquires a distributed lock with the given name.
+    // The lock is associated with the provided lease_id and will be
+    // automatically released when the lease expires.
+    // Returns a lock header with the key that was locked.
+    rpc Lock(LockRequest) returns (LockResponse);
+    // Unlock releases a distributed lock.
+    rpc Unlock(UnlockRequest) returns (UnlockResponse);
+    // LockQuery returns information about a lock.
+    rpc LockQuery(LockQueryRequest) returns (LockQueryResponse);
+}
+
+message LockRequest {
+    // name is the name of the lock to acquire.
+    bytes name = 1;
+    // lease_id is the lease to associate with the lock.
+    // If 0, the lock will not be associated with a lease
+    // and must be explicitly unlocked.
+    int64 lease_id = 2;
+}
+
+message LockResponse {
+    ResponseHeader header = 1;
+    // key is the key that was created for the lock.
+    // This can be used to unlock or query the lock.
+    bytes key = 2;
+}
+
+message UnlockRequest {
+    // key is the key returned by Lock.
+    bytes key = 1;
+}
+
+message UnlockResponse {
+    ResponseHeader header = 1;
+}
+
+message LockQueryRequest {
+    // name is the name of the lock to query.
+    bytes name = 1;
+}
+
+message LockQueryResponse {
+    ResponseHeader header = 1;
+    // owner is the key that currently holds the lock, empty if unlocked.
+    bytes owner = 2;
+    // lease_id is the lease associated with the lock, 0 if none.
+    int64 lease_id = 3;
+}
