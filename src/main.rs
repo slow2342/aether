@@ -10,25 +10,29 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 use aether::api::health::HealthStatus;
 use aether::api::metrics::{MetricsLayer, MetricsRegistry};
 use aether::api::{
-    AuthService, ClusterService, ElectionService, KvService, LeaseService, LockService,
-    MaintenanceService, ShardService, WatchService,
+    AuthService, BarrierService, ClusterService, ElectionService, KvService, LeaseService,
+    LockService, MaintenanceService, QueueService, ShardService, WatchService,
 };
 use aether::auth::AuthLayer;
+use aether::barrier::BarrierManager;
 use aether::cluster::AlarmManager;
 use aether::config::{AetherConfig, LogConfig};
 use aether::election::ElectionManager;
 use aether::lease::{LeaseManager, LeaseStore};
 use aether::lock::LockManager;
 use aether::proto::aether_auth_server::AetherAuthServer;
+use aether::proto::aether_barrier_server::AetherBarrierServer;
 use aether::proto::aether_cluster_server::AetherClusterServer;
 use aether::proto::aether_election_server::AetherElectionServer;
 use aether::proto::aether_kv_server::AetherKvServer;
 use aether::proto::aether_lease_server::AetherLeaseServer;
 use aether::proto::aether_lock_server::AetherLockServer;
 use aether::proto::aether_maintenance_server::AetherMaintenanceServer;
+use aether::proto::aether_queue_server::AetherQueueServer;
 use aether::proto::aether_shard_server::AetherShardServer;
 use aether::proto::aether_watch_server::AetherWatchServer;
 use aether::proto::raft_rpc::raft_rpc_server::RaftRpcServer;
+use aether::queue::QueueManager;
 use aether::raft::node;
 use aether::raft::raftrs_handle::RaftRsHandle;
 use aether::raft::raftrs_store::RaftRsStore;
@@ -311,6 +315,13 @@ async fn main() -> anyhow::Result<()> {
     let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
     let election_manager_for_api = election_manager.clone();
 
+    // Create barrier manager (shared between state machine and API layer)
+    let barrier_manager = Arc::new(Mutex::new(BarrierManager::new()));
+    let barrier_manager_for_api = barrier_manager.clone();
+
+    // Create queue manager (shared between state machine and API layer)
+    let queue_manager = Arc::new(Mutex::new(QueueManager::new()));
+
     let state_machine = Arc::new(Mutex::new(AetherStateMachine::new(
         watch_tx.clone(),
         storage.clone(),
@@ -321,6 +332,8 @@ async fn main() -> anyhow::Result<()> {
         shard_manager,
         lock_manager,
         election_manager,
+        barrier_manager,
+        queue_manager,
     )));
     // auth_enabled is cloned above; keep a reference for ClusterService below
 
@@ -381,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
     let watch_manager = WatchManager::new(watch_tx);
     let watch_manager_for_metrics = watch_manager.clone();
     let watch_manager_for_election = watch_manager.clone();
+    let watch_manager_for_barrier = watch_manager.clone();
     let watch_service = WatchService::new(
         watch_manager,
         auth_enabled.clone(),
@@ -399,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
     let auth_enabled_for_api = auth_enabled.clone();
     let storage_for_maintenance = storage.clone();
     let storage_for_election = storage.clone();
+    let storage_for_queue = storage.clone();
     let kv_service = KvService::new(
         storage,
         raft_handle.clone(),
@@ -444,6 +459,15 @@ async fn main() -> anyhow::Result<()> {
         storage_for_election,
         watch_manager_for_election,
     );
+
+    let barrier_service = BarrierService::new(
+        raft_handle.clone(),
+        config.node_id,
+        barrier_manager_for_api,
+        watch_manager_for_barrier,
+    );
+
+    let queue_service = QueueService::new(raft_handle.clone(), config.node_id, storage_for_queue);
 
     let alarm_manager = Arc::new(AlarmManager::new());
     let maintenance_service = MaintenanceService::new(
@@ -571,6 +595,8 @@ async fn main() -> anyhow::Result<()> {
         .add_service(AetherLeaseServer::new(lease_service))
         .add_service(AetherLockServer::new(lock_service))
         .add_service(AetherElectionServer::new(election_service))
+        .add_service(AetherBarrierServer::new(barrier_service))
+        .add_service(AetherQueueServer::new(queue_service))
         .add_service(AetherClusterServer::new(cluster_service))
         .add_service(AetherMaintenanceServer::new(maintenance_service))
         .add_service(AetherShardServer::new(shard_service))

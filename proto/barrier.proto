@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherBarrier provides distributed barrier operations.
+// A barrier is a synchronization primitive: while the barrier exists,
+// other callers that try to enter it will block until the barrier
+// is released or its lease expires.
+service AetherBarrier {
+    // Create creates and holds a barrier with the given name.
+    // Other callers trying to enter will block until this barrier
+    // is released or its lease expires.
+    // Returns a barrier key that can be used to release or query.
+    rpc Create(BarrierCreateRequest) returns (BarrierCreateResponse);
+    // Release releases the barrier, unblocking all waiters.
+    rpc Release(BarrierReleaseRequest) returns (BarrierReleaseResponse);
+    // Query returns whether the barrier is currently held.
+    rpc Query(BarrierQueryRequest) returns (BarrierQueryResponse);
+}
+
+message BarrierCreateRequest {
+    // name is the barrier name.
+    bytes name = 1;
+    // lease_id is the lease to associate with the barrier.
+    // If 0, the barrier will not be associated with a lease
+    // and must be explicitly released.
+    int64 lease_id = 2;
+}
+
+message BarrierCreateResponse {
+    ResponseHeader header = 1;
+    // key is the key created for the barrier.
+    bytes key = 2;
+}
+
+message BarrierReleaseRequest {
+    // name is the barrier name to release.
+    bytes name = 1;
+}
+
+message BarrierReleaseResponse {
+    ResponseHeader header = 1;
+}
+
+message BarrierQueryRequest {
+    // name is the barrier name to query.
+    bytes name = 1;
+}
+
+message BarrierQueryResponse {
+    ResponseHeader header = 1;
+    // held is true if the barrier is currently held.
+    bool held = 2;
+    // key is the barrier key if held, empty otherwise.
+    bytes key = 3;
+    // lease_id is the lease associated with the barrier, 0 if none.
+    int64 lease_id = 4;
+}

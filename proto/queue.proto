@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package aether;
+
+import "common.proto";
+
+// AetherQueue provides distributed FIFO queue operations.
+// Items are stored with sequential keys under a named queue prefix.
+// Enqueue appends an item; Dequeue pops the front item atomically.
+service AetherQueue {
+    // Enqueue adds an item to the named queue.
+    rpc Enqueue(QueueEnqueueRequest) returns (QueueEnqueueResponse);
+    // Dequeue removes and returns the front item from the named queue.
+    // Returns NOT_FOUND if the queue is empty.
+    rpc Dequeue(QueueDequeueRequest) returns (QueueDequeueResponse);
+    // Peek returns the front item without removing it.
+    // Returns NOT_FOUND if the queue is empty.
+    rpc Peek(QueuePeekRequest) returns (QueuePeekResponse);
+}
+
+message QueueEnqueueRequest {
+    // name is the queue name.
+    bytes name = 1;
+    // value is the item to enqueue.
+    bytes value = 2;
+}
+
+message QueueEnqueueResponse {
+    ResponseHeader header = 1;
+    // key is the key assigned to the enqueued item.
+    bytes key = 2;
+}
+
+message QueueDequeueRequest {
+    // name is the queue name.
+    bytes name = 1;
+}
+
+message QueueDequeueResponse {
+    ResponseHeader header = 1;
+    // key is the key of the dequeued item.
+    bytes key = 2;
+    // value is the value of the dequeued item.
+    bytes value = 3;
+}
+
+message QueuePeekRequest {
+    // name is the queue name.
+    bytes name = 1;
+}
+
+message QueuePeekResponse {
+    ResponseHeader header = 1;
+    // key is the key of the front item.
+    bytes key = 2;
+    // value is the value of the front item.
+    bytes value = 3;
+}

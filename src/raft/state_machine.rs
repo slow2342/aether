@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use rocksdb::WriteBatch;
 
-use super::{KeyValue, RaftRequest, RaftResponse, WatchEvent};
+use super::{KeyValue, RaftRequest, RaftResponse, WatchEvent, WatchEventType};
 use crate::auth::AuthCache;
+use crate::barrier::BarrierManager;
 use crate::election::ElectionManager;
 use crate::lease::{LeaseManager, LeaseStore};
 use crate::lock::LockManager;
+use crate::queue::QueueManager;
 use crate::shard::manager::ShardManager;
 use crate::storage::mvcc::{
     KeyIndex, MvccValue, encode_mvcc_key, load_key_indexes, save_global_revision,
@@ -84,6 +86,10 @@ pub struct AetherStateMachine {
     pub lock_manager: Arc<Mutex<LockManager>>,
     /// In-memory election manager (shared with API layer).
     pub election_manager: Arc<Mutex<ElectionManager>>,
+    /// In-memory barrier manager (shared with API layer).
+    pub barrier_manager: Arc<Mutex<BarrierManager>>,
+    /// In-memory queue manager (shared with API layer).
+    pub queue_manager: Arc<Mutex<QueueManager>>,
 }
 
 /// Captures pre-mutation in-memory state for keys touched during an apply.
@@ -204,6 +210,8 @@ impl AetherStateMachine {
         shard_manager: Arc<Mutex<ShardManager>>,
         lock_manager: Arc<Mutex<LockManager>>,
         election_manager: Arc<Mutex<ElectionManager>>,
+        barrier_manager: Arc<Mutex<BarrierManager>>,
+        queue_manager: Arc<Mutex<QueueManager>>,
     ) -> Self {
         let key_indexes = load_key_indexes(storage.db(), storage.mvcc_cf())
             .expect("failed to load key indexes from mvcc CF");
@@ -226,6 +234,22 @@ impl AetherStateMachine {
             }
         }
 
+        // Restore barrier state from persistent storage
+        {
+            let mut mgr = barrier_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&storage) {
+                tracing::error!(error = %e, "failed to restore barrier state from storage");
+            }
+        }
+
+        // Restore queue state from persistent storage
+        {
+            let mut mgr = queue_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&storage) {
+                tracing::error!(error = %e, "failed to restore queue state from storage");
+            }
+        }
+
         Self {
             last_applied: 0,
             storage,
@@ -240,6 +264,8 @@ impl AetherStateMachine {
             shard_manager,
             lock_manager,
             election_manager,
+            barrier_manager,
+            queue_manager,
         }
     }
 
@@ -1031,6 +1057,14 @@ impl AetherStateMachine {
             RaftRequest::ElectionResign { leader_key } => {
                 self.apply_election_resign(leader_key, revision)
             }
+            RaftRequest::BarrierCreate { name, lease_id } => {
+                self.apply_barrier_create(name, lease_id, revision)
+            }
+            RaftRequest::BarrierRelease { name } => self.apply_barrier_release(name, revision),
+            RaftRequest::QueueEnqueue { name, value } => {
+                self.apply_queue_enqueue(name, value, revision)
+            }
+            RaftRequest::QueueDequeue { name } => self.apply_queue_dequeue(name, revision),
         }
     }
 
@@ -1150,6 +1184,9 @@ impl AetherStateMachine {
 
         // Release all elections associated with this lease
         self.apply_election_release_by_lease(id);
+
+        // Release all barriers associated with this lease
+        self.apply_barrier_release_by_lease(id);
 
         // If no user-data keys and lease already gone, this is an idempotent no-op.
         if key_values.is_empty() {
@@ -2013,6 +2050,262 @@ impl AetherStateMachine {
         );
     }
 
+    fn apply_barrier_create(
+        &mut self,
+        name: Vec<u8>,
+        lease_id: i64,
+        _revision: u64,
+    ) -> RaftResponse {
+        // Check if barrier already exists
+        {
+            let mgr = self.barrier_manager.lock().unwrap();
+            if mgr.is_held(&name) {
+                let existing_key = mgr.get_key(&name).unwrap_or_default().to_vec();
+                return RaftResponse::BarrierAlreadyHeld {
+                    current_key: existing_key,
+                };
+            }
+        }
+
+        let key = crate::barrier::barrier_key(&name);
+        let value = crate::barrier::BarrierManager::encode_value(&name, lease_id);
+
+        // Write to KV store
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.storage.default_cf(), &key, &value);
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to write barrier: {e}"),
+            };
+        }
+
+        // Update in-memory state
+        {
+            let mut mgr = self.barrier_manager.lock().unwrap();
+            mgr.create(name, key.clone(), lease_id);
+        }
+
+        tracing::debug!(
+            barrier = %String::from_utf8_lossy(&key),
+            lease_id = lease_id,
+            "barrier created"
+        );
+
+        RaftResponse::BarrierCreate { key }
+    }
+
+    fn apply_barrier_release(&mut self, name: Vec<u8>, _revision: u64) -> RaftResponse {
+        let key = crate::barrier::barrier_key(&name);
+
+        // Check if barrier exists
+        {
+            let mgr = self.barrier_manager.lock().unwrap();
+            if !mgr.is_held(&name) {
+                return RaftResponse::BarrierRelease {};
+            }
+        }
+
+        // Delete from KV store
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(self.storage.default_cf(), &key);
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to delete barrier: {e}"),
+            };
+        }
+
+        // Update in-memory state
+        {
+            let mut mgr = self.barrier_manager.lock().unwrap();
+            mgr.release(&key);
+        }
+
+        // Emit watch event so waiting clients can be notified
+        let event = WatchEvent {
+            event_type: WatchEventType::Delete,
+            kv: KeyValue {
+                key,
+                value: Vec::new(),
+                create_revision: 0,
+                mod_revision: 0,
+                version: 0,
+                lease: 0,
+            },
+            prev_kv: None,
+        };
+        let _ = self.watch_tx.send(event);
+
+        tracing::debug!(
+            barrier = %String::from_utf8_lossy(&name),
+            "barrier released"
+        );
+
+        RaftResponse::BarrierRelease {}
+    }
+
+    fn apply_barrier_release_by_lease(&mut self, lease_id: i64) {
+        let keys_to_release: Vec<Vec<u8>> = {
+            let mgr = self.barrier_manager.lock().unwrap();
+            mgr.get_keys_by_lease(lease_id)
+        };
+
+        if keys_to_release.is_empty() {
+            return;
+        }
+
+        let mut batch = WriteBatch::default();
+        for key in &keys_to_release {
+            batch.delete_cf(self.storage.default_cf(), key);
+        }
+
+        if let Err(e) = self.storage.db().write(batch) {
+            tracing::error!(error = %e, lease_id = lease_id, "failed to delete barrier keys for lease");
+            return;
+        }
+
+        {
+            let mut mgr = self.barrier_manager.lock().unwrap();
+            mgr.release_by_lease(lease_id);
+        }
+
+        // Emit watch events for each released barrier
+        let count = keys_to_release.len();
+        for key in keys_to_release {
+            let event = WatchEvent {
+                event_type: WatchEventType::Delete,
+                kv: KeyValue {
+                    key,
+                    value: Vec::new(),
+                    create_revision: 0,
+                    mod_revision: 0,
+                    version: 0,
+                    lease: 0,
+                },
+                prev_kv: None,
+            };
+            let _ = self.watch_tx.send(event);
+        }
+
+        tracing::debug!(
+            lease_id = lease_id,
+            count = count,
+            "released barriers for lease"
+        );
+    }
+
+    fn apply_queue_enqueue(
+        &mut self,
+        name: Vec<u8>,
+        value: Vec<u8>,
+        _revision: u64,
+    ) -> RaftResponse {
+        // Get next sequence number and meta key
+        let (seq, meta_key) = {
+            let mut mgr = self.queue_manager.lock().unwrap();
+            let seq = mgr.next_seq(&name);
+            let meta_key = crate::queue::queue_meta_key(&name);
+            (seq, meta_key)
+        };
+
+        let item_key = crate::queue::queue_item_key(&name, seq);
+        // Persist next sequence number (seq + 1), not current seq.
+        // On restore, this value is loaded as the next seq to use.
+        let next_seq = seq.checked_add(1).unwrap_or(0);
+        let next_seq_bytes = next_seq.to_be_bytes();
+
+        // Write item and update meta atomically
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.storage.default_cf(), &item_key, &value);
+        batch.put_cf(self.storage.default_cf(), &meta_key, next_seq_bytes);
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to enqueue: {e}"),
+            };
+        }
+
+        // Emit watch event so waiting clients can be notified.
+        // Use empty value in watch event to avoid cloning potentially large values.
+        // Clients that need the value can fetch it from storage using the key.
+        let event = WatchEvent {
+            event_type: WatchEventType::Put,
+            kv: KeyValue {
+                key: item_key.clone(),
+                value: Vec::new(),
+                create_revision: 0,
+                mod_revision: 0,
+                version: 0,
+                lease: 0,
+            },
+            prev_kv: None,
+        };
+        let _ = self.watch_tx.send(event);
+
+        tracing::debug!(
+            queue = %String::from_utf8_lossy(&name),
+            seq = seq,
+            "item enqueued"
+        );
+
+        RaftResponse::QueueEnqueue { key: item_key }
+    }
+
+    fn apply_queue_dequeue(&mut self, name: Vec<u8>, _revision: u64) -> RaftResponse {
+        // Find the front item by scanning with the queue prefix
+        let prefix = crate::queue::queue_scan_prefix(&name);
+        let entries = match self.storage.scan(&prefix, 1) {
+            Ok(entries) => entries,
+            Err(e) => {
+                return RaftResponse::Error {
+                    message: format!("failed to scan queue: {e}"),
+                };
+            }
+        };
+
+        if entries.is_empty() {
+            return RaftResponse::QueueDequeueEmpty {};
+        }
+
+        let front = &entries[0];
+        let item_key = front.key.clone();
+        let item_value = front.value.clone();
+
+        // Delete the item from KV store
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(self.storage.default_cf(), &item_key);
+        if let Err(e) = self.storage.db().write(batch) {
+            return RaftResponse::Error {
+                message: format!("failed to dequeue: {e}"),
+            };
+        }
+
+        // Emit watch event for the deleted item.
+        // Use empty value in watch event to avoid cloning potentially large values.
+        let event = WatchEvent {
+            event_type: WatchEventType::Delete,
+            kv: KeyValue {
+                key: item_key.clone(),
+                value: Vec::new(),
+                create_revision: 0,
+                mod_revision: 0,
+                version: 0,
+                lease: 0,
+            },
+            prev_kv: None,
+        };
+        let _ = self.watch_tx.send(event);
+
+        tracing::debug!(
+            queue = %String::from_utf8_lossy(&name),
+            key = %String::from_utf8_lossy(&item_key),
+            "item dequeued"
+        );
+
+        RaftResponse::QueueDequeue {
+            key: item_key,
+            value: item_value,
+        }
+    }
+
     /// Maximum allowed snapshot size (512 MiB).  Prevents OOM when the database
     /// is larger than available memory.  The serialized snapshot is typically
     /// 1-2x the raw CF data size, so this limits total memory to ~1.5 GiB.
@@ -2171,12 +2464,30 @@ impl AetherStateMachine {
             }
         }
 
+        // Rebuild barrier manager from persisted barrier data.
+        {
+            let mut mgr = self.barrier_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&self.storage) {
+                tracing::warn!(error = %e, "failed to restore barrier manager from snapshot");
+            }
+        }
+
+        // Rebuild queue manager from persisted queue data.
+        {
+            let mut mgr = self.queue_manager.lock().unwrap();
+            if let Err(e) = mgr.restore(&self.storage) {
+                tracing::warn!(error = %e, "failed to restore queue manager from snapshot");
+            }
+        }
+
         self.last_applied = applied_index;
         tracing::info!(
             applied_index,
             keys = self.key_metas.len(),
             locks = self.lock_manager.lock().unwrap().lock_count(),
             elections = self.election_manager.lock().unwrap().election_count(),
+            barriers = self.barrier_manager.lock().unwrap().barrier_count(),
+            queues = self.queue_manager.lock().unwrap().queue_count(),
             "restored from snapshot"
         );
         Ok(())
@@ -2262,8 +2573,10 @@ impl AetherStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::barrier::BarrierManager;
     use crate::election::ElectionManager;
     use crate::lease::now_millis;
+    use crate::queue::QueueManager;
     use crate::raft::{self, WatchEventType};
     use tempfile::tempdir;
 
@@ -2279,6 +2592,8 @@ mod tests {
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager = Arc::new(Mutex::new(QueueManager::new()));
         let sm = AetherStateMachine::new(
             tx.clone(),
             storage.clone(),
@@ -2289,6 +2604,8 @@ mod tests {
             shard_manager,
             lock_manager,
             election_manager,
+            barrier_manager,
+            queue_manager,
         );
         (dir, storage, sm)
     }
@@ -2459,6 +2776,8 @@ mod tests {
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2469,6 +2788,8 @@ mod tests {
             shard_manager,
             lock_manager,
             election_manager,
+            barrier_manager,
+            queue_manager,
         );
 
         sm.apply_request(
@@ -2500,6 +2821,8 @@ mod tests {
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2510,6 +2833,8 @@ mod tests {
             shard_manager,
             lock_manager,
             election_manager,
+            barrier_manager,
+            queue_manager,
         );
 
         sm.apply_request(
@@ -2762,6 +3087,8 @@ mod tests {
         let shard_manager = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager = Arc::new(Mutex::new(LockManager::new()));
         let election_manager = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm = AetherStateMachine::new(
             tx,
             storage,
@@ -2772,6 +3099,8 @@ mod tests {
             shard_manager,
             lock_manager,
             election_manager,
+            barrier_manager,
+            queue_manager,
         );
 
         sm.apply_request(
@@ -3628,6 +3957,8 @@ mod tests {
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
         let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager2 = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager2 = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3638,6 +3969,8 @@ mod tests {
             shard_manager2,
             lock_manager2,
             election_manager2,
+            barrier_manager2,
+            queue_manager2,
         );
 
         // Write different data to sm2 to verify it gets overwritten.
@@ -3703,6 +4036,8 @@ mod tests {
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
         let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager2 = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager2 = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3713,6 +4048,8 @@ mod tests {
             shard_manager2,
             lock_manager2,
             election_manager2,
+            barrier_manager2,
+            queue_manager2,
         );
 
         sm2.restore_snapshot(&snapshot_data, 2).unwrap();
@@ -3768,6 +4105,8 @@ mod tests {
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
         let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager2 = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager2 = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3778,6 +4117,8 @@ mod tests {
             shard_manager2,
             lock_manager2,
             election_manager2,
+            barrier_manager2,
+            queue_manager2,
         );
 
         // Verify lock exists in fresh state machine (from startup restore).
@@ -3853,6 +4194,8 @@ mod tests {
         let shard_manager2 = Arc::new(Mutex::new(ShardManager::new()));
         let lock_manager2 = Arc::new(Mutex::new(LockManager::new()));
         let election_manager2 = Arc::new(Mutex::new(ElectionManager::new()));
+        let barrier_manager2 = Arc::new(Mutex::new(BarrierManager::new()));
+        let queue_manager2 = Arc::new(Mutex::new(QueueManager::new()));
         let mut sm2 = AetherStateMachine::new(
             tx2,
             storage.clone(),
@@ -3863,6 +4206,8 @@ mod tests {
             shard_manager2,
             lock_manager2,
             election_manager2,
+            barrier_manager2,
+            queue_manager2,
         );
 
         // Restore from snapshot.
