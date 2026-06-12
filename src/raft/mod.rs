@@ -83,6 +83,10 @@ pub enum RaftRequest {
     RegionSplit { region_id: u64, split_key: Vec<u8> },
     /// Update region metadata (leader change, replica change)
     RegionUpdate { region: crate::shard::Region },
+    /// Acquire a distributed lock
+    LockAcquire { name: Vec<u8>, lease_id: i64 },
+    /// Release a distributed lock
+    LockRelease { key: Vec<u8> },
 }
 
 /// Raft response types
@@ -127,6 +131,10 @@ pub enum RaftResponse {
         child: crate::shard::Region,
     },
     RegionUpdate {},
+    LockAcquire {
+        key: Vec<u8>,
+    },
+    LockRelease {},
     /// Storage error during apply
     Error {
         message: String,
