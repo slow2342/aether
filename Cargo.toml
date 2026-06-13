@@ -2,6 +2,7 @@
 name = "aether"
 version = "0.1.0"
 edition = "2024"
+default-run = "aether"
 
 [dependencies]
 # --- Raft consensus ---
@@ -70,3 +71,20 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "raft_store"
+harness = false
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bin]]
+name = "aether-bench"
+path = "src/bin/aether-bench/main.rs"
