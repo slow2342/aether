@@ -421,6 +421,7 @@ fn raft_event_loop(
 
             let mut ready = node.ready();
 
+            // Step 1: Persist entries to the log store.
             if !ready.entries().is_empty()
                 && let Err(e) = node.store().append_entries(ready.entries())
             {
@@ -428,6 +429,7 @@ fn raft_event_loop(
                 return;
             }
 
+            // Step 2: Persist hard state (term, vote, commit).
             if let Some(hs) = ready.hs()
                 && let Err(e) = node.store().save_hard_state(hs)
             {
@@ -435,32 +437,45 @@ fn raft_event_loop(
                 return;
             }
 
+            // Step 3: Send outgoing messages.
             let messages = ready.take_messages();
             if !messages.is_empty() {
                 let _ = msg_out_tx.blocking_send(messages);
             }
 
+            // Step 4: Handle incoming snapshot.
             let snapshot = ready.snapshot();
             if !is_empty_snapshot(snapshot) {
-                // Follower received a snapshot from the leader.
-                // If snapshot application fails, the node is in an inconsistent
-                // state (store updated but state machine not restored).  We MUST
-                // stop the event loop to prevent applying subsequent entries on
-                // top of stale state machine data.
                 if let Err(e) =
                     apply_snapshot_to_state(snapshot, node.store(), &state_machine, &shared_state)
                 {
                     tracing::error!(error = %e, "FATAL: snapshot application failed, stopping node");
                     return;
                 }
-                // Update tracking so that if this node later becomes leader,
-                // it won't immediately create a redundant snapshot.
                 last_snapshot_applied = snapshot.get_metadata().index;
             }
 
-            let committed = ready.take_committed_entries();
+            // Step 5: Process ReadIndex responses.
+            for rs in ready.take_read_states() {
+                if let Some(tx) = pending_read_index.remove(&rs.request_ctx) {
+                    let _ = tx.send(Ok(rs.index));
+                } else {
+                    tracing::debug!(
+                        index = rs.index,
+                        ctx_len = rs.request_ctx.len(),
+                        "read state context not found in pending (likely timed out)"
+                    );
+                }
+            }
+
+            // Step 6: Advance raft state. This MUST happen before processing
+            // committed entries — raft-rs 0.7 delivers committed entries via
+            // the LightReady returned by advance(), not in the original Ready.
+            let mut light_ready = node.advance(ready);
+
+            // Step 7: Process committed entries from LightReady.
+            let committed = light_ready.take_committed_entries();
             if !committed.is_empty() {
-                // Track the highest committed index for ReadIndex
                 let max_committed = committed.last().map(|e| e.index).unwrap_or(0);
                 shared_state
                     .commit_index
@@ -481,11 +496,6 @@ fn raft_event_loop(
                     }
                     drop(sm);
 
-                    // Persist applied index so we don't re-apply on restart.
-                    // Update shared_state regardless of persistence result — the
-                    // entries are already applied to the state machine, so the
-                    // in-memory index must track that. On crash+restart, we fall
-                    // back to the persisted value and re-apply (idempotent).
                     if let Err(e) = node.store().save_applied_index(new_applied) {
                         tracing::error!(error = %e, "failed to persist applied index");
                     }
@@ -516,8 +526,7 @@ fn raft_event_loop(
                         }
                     }
 
-                    // Leader-side snapshot trigger: create snapshot when enough
-                    // entries have been applied since the last snapshot.
+                    // Leader-side snapshot trigger.
                     if snapshot_trigger > 0
                         && node.raft.state == StateRole::Leader
                         && new_applied - last_snapshot_applied >= snapshot_trigger
@@ -526,8 +535,6 @@ fn raft_event_loop(
                             Ok(()) => last_snapshot_applied = new_applied,
                             Err(e) => {
                                 tracing::error!(error = %e, "failed to create snapshot");
-                                // Do NOT update last_snapshot_applied — the next
-                                // apply will retry the snapshot creation.
                             }
                         }
                     }
@@ -537,20 +544,16 @@ fn raft_event_loop(
                 shared_state.applied_notify.notify_waiters();
             }
 
-            // Process ReadIndex responses: match each read state's context
-            // against pending read index requests and resolve them.
-            for rs in ready.take_read_states() {
-                if let Some(tx) = pending_read_index.remove(&rs.request_ctx) {
-                    let _ = tx.send(Ok(rs.index));
-                } else {
-                    tracing::debug!(
-                        index = rs.index,
-                        ctx_len = rs.request_ctx.len(),
-                        "read state context not found in pending (likely timed out)"
-                    );
-                }
+            // Step 8: Send any additional messages from LightReady.
+            let light_messages = light_ready.take_messages();
+            if !light_messages.is_empty() {
+                let _ = msg_out_tx.blocking_send(light_messages);
             }
 
+            // Step 9: Signal that committed entries have been applied.
+            node.advance_apply();
+
+            // Track leader changes and drain pending on step-down.
             let is_leader = node.raft.state == StateRole::Leader;
             if was_leader && !is_leader {
                 for (_, tx) in pending.drain() {
@@ -572,8 +575,6 @@ fn raft_event_loop(
                 .leader_id
                 .store(node.raft.leader_id, Ordering::Relaxed);
             shared_state.term.store(node.raft.term, Ordering::Relaxed);
-
-            node.advance(ready);
         }
     }
 }
