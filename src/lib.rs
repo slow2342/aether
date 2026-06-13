@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod config;
 pub mod election;
 pub mod error;
+pub mod gateway;
 pub mod lease;
 pub mod lock;
 pub mod proto;
