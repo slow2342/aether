@@ -141,6 +141,34 @@ struct Cli {
     /// DNS hosts for dns discovery (comma-separated)
     #[arg(long, value_delimiter = ',')]
     discovery_dns_hosts: Option<Vec<String>>,
+
+    /// Run in gateway (proxy) mode instead of Raft node mode.
+    #[arg(long)]
+    gateway: bool,
+
+    /// Backend cluster node addresses for gateway mode (comma-separated host:port).
+    #[arg(long, value_delimiter = ',')]
+    backends: Option<Vec<String>>,
+
+    /// Request timeout for gateway-to-backend RPCs in milliseconds.
+    #[arg(long, default_value_t = 5000)]
+    request_timeout_ms: u64,
+
+    /// CA certificate file for gateway TLS.
+    #[arg(long)]
+    tls_ca: Option<String>,
+
+    /// Client certificate file for gateway TLS.
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Client key file for gateway TLS.
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Health check HTTP listen address for gateway mode.
+    #[arg(long, default_value = "127.0.0.1:9091")]
+    health_addr: String,
 }
 
 #[tokio::main]
@@ -194,6 +222,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tracing with config
     init_tracing(&config.log);
+
+    // Gateway mode: start stateless proxy instead of Raft node
+    if cli.gateway {
+        let backends = cli
+            .backends
+            .ok_or_else(|| anyhow::anyhow!("--backends is required in gateway mode"))?;
+        if backends.is_empty() {
+            anyhow::bail!("at least one backend address is required");
+        }
+        let mut gw_config = aether::gateway::GatewayConfig::new(config.addr, backends);
+        gw_config.request_timeout_ms = cli.request_timeout_ms;
+        gw_config.health_addr = cli.health_addr;
+        if let (Some(ca), Some(cert), Some(key)) = (cli.tls_ca, cli.tls_cert, cli.tls_key) {
+            gw_config.tls = Some(aether::gateway::TlsConfig {
+                ca_cert: ca,
+                client_cert: cert,
+                client_key: key,
+            });
+        }
+        return aether::gateway::run_gateway(gw_config).await;
+    }
 
     tracing::info!("Aether starting...");
     tracing::info!(
