@@ -15,7 +15,7 @@ use aether::api::{
 };
 use aether::auth::AuthLayer;
 use aether::barrier::BarrierManager;
-use aether::cluster::AlarmManager;
+use aether::cluster::{AlarmManager, PeerInfo};
 use aether::config::{AetherConfig, LogConfig};
 use aether::election::ElectionManager;
 use aether::lease::{LeaseManager, LeaseStore};
@@ -125,6 +125,22 @@ struct Cli {
     /// Data directory
     #[arg(short, long)]
     data_dir: Option<String>,
+
+    /// Discovery method: static, dns, token
+    #[arg(long)]
+    discovery_method: Option<String>,
+
+    /// Discovery token file path (for token method)
+    #[arg(long)]
+    discovery_token_file: Option<String>,
+
+    /// Expected cluster size for token discovery
+    #[arg(long)]
+    discovery_expected_size: Option<usize>,
+
+    /// DNS hosts for dns discovery (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    discovery_dns_hosts: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -147,6 +163,20 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(data_dir) = cli.data_dir {
         config.data_dir = PathBuf::from(data_dir);
+    }
+
+    // Override discovery config with CLI args
+    if let Some(method) = cli.discovery_method {
+        config.cluster.discovery.method = method;
+    }
+    if let Some(token_file) = cli.discovery_token_file {
+        config.cluster.discovery.token_file = PathBuf::from(token_file);
+    }
+    if let Some(expected_size) = cli.discovery_expected_size {
+        config.cluster.discovery.token_expected_size = expected_size;
+    }
+    if let Some(dns_hosts) = cli.discovery_dns_hosts {
+        config.cluster.discovery.dns_hosts = dns_hosts;
     }
 
     // Validate addresses early for clear error messages
@@ -356,18 +386,50 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    // Build node address map
-    let mut node_addrs = std::collections::HashMap::new();
-    node_addrs.insert(config.node_id, config.addr.clone());
-    for peer in &config.cluster.peers {
-        node_addrs.insert(peer.node_id, peer.addr.clone());
-    }
+    // Discover peers: use discovery service if configured, otherwise fall back to static config.
+    let self_info = PeerInfo {
+        node_id: config.node_id,
+        addr: config.addr.clone(),
+    };
 
-    // Build initial peers list
-    let mut initial_peers = vec![(config.node_id, config.addr.clone())];
-    for peer in &config.cluster.peers {
-        initial_peers.push((peer.node_id, peer.addr.clone()));
+    let discovered_peers: Vec<(u64, String)> = if config.cluster.discovery.method != "static" {
+        let provider = aether::cluster::discovery::build_provider(
+            &config.cluster.discovery,
+            self_info.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("discovery config error: {e}"))?;
+
+        tracing::info!(method = %config.cluster.discovery.method, "starting peer discovery");
+        let peers = provider
+            .discover()
+            .await
+            .map_err(|e| anyhow::anyhow!("discovery failed: {e}"))?;
+
+        tracing::info!(peer_count = peers.len(), "discovery completed");
+        let mut result: Vec<(u64, String)> =
+            peers.into_iter().map(|p| (p.node_id, p.addr)).collect();
+        // Ensure self is always in the peer list (DNS discovery may not include it).
+        if !result.iter().any(|(id, _)| *id == config.node_id) {
+            result.push((config.node_id, config.addr.clone()));
+        }
+        result
+    } else {
+        // Static discovery from config
+        let mut peers = vec![(config.node_id, config.addr.clone())];
+        for peer in &config.cluster.peers {
+            peers.push((peer.node_id, peer.addr.clone()));
+        }
+        peers
+    };
+
+    // Deduplicate by node_id (last entry wins) and build node address map.
+    // Token discovery may accumulate duplicate entries on restart.
+    let mut seen = std::collections::HashMap::new();
+    for (id, addr) in discovered_peers {
+        seen.insert(id, addr);
     }
+    let initial_peers: Vec<(u64, String)> = seen.clone().into_iter().collect();
+    let node_addrs = seen;
 
     // Channel for outgoing raft messages (event loop → network sender)
     let (msg_out_tx, msg_out_rx) = tokio::sync::mpsc::channel(1024);

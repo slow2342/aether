@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::cluster::discovery::DiscoveryConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AetherConfig {
     #[serde(default = "default_node_id")]
@@ -45,6 +47,10 @@ pub struct ClusterConfig {
     /// Number of committed log entries that triggers a snapshot.
     #[serde(default = "default_snapshot_trigger")]
     pub snapshot_trigger_log_entries: u64,
+
+    /// Discovery configuration for dynamic cluster bootstrap.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +148,7 @@ impl Default for ClusterConfig {
             heartbeat_interval_ms: default_heartbeat_interval(),
             election_timeout_ms: default_election_timeout(),
             snapshot_trigger_log_entries: default_snapshot_trigger(),
+            discovery: DiscoveryConfig::default(),
         }
     }
 }
