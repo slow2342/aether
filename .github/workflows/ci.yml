@@ -34,6 +34,7 @@ jobs:
               - 'src/**'
               - 'proto/**'
               - 'tests/**'
+              - 'benches/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'build.rs'
@@ -131,10 +132,25 @@ jobs:
       - run: cargo build
       - run: git diff --exit-code src/generated/
 
+  bench:
+    name: Benchmark Compile Check
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: Linux-X64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+      - run: cargo bench --all -- --test
+
   ci-required:
     name: CI Required
     if: always()
-    needs: [changes, fmt, clippy, test, proto]
+    needs: [changes, fmt, clippy, test, proto, bench]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -148,7 +164,8 @@ jobs:
           if [ "${{ needs.changes.outputs.code }}" == "true" ]; then
             if [ "${{ needs.clippy.result }}" != "success" ] || \
                [ "${{ needs.test.result }}" != "success" ] || \
-               [ "${{ needs.proto.result }}" != "success" ]; then
+               [ "${{ needs.proto.result }}" != "success" ] || \
+               [ "${{ needs.bench.result }}" != "success" ]; then
               echo "Code checks failed"
               exit 1
             fi
